@@ -8,11 +8,16 @@ import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.FontMetrics;
 import java.awt.Graphics2D;
+import java.awt.Graphics;
 import java.awt.Image;
 import java.awt.Insets;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
 import java.awt.RenderingHints;
 import java.awt.Rectangle;
+import java.awt.Point;
 import java.awt.Toolkit;
 import java.awt.KeyboardFocusManager;
 import java.awt.datatransfer.Clipboard;
@@ -21,6 +26,7 @@ import java.awt.datatransfer.Transferable;
 import java.awt.datatransfer.UnsupportedFlavorException;
 import java.awt.event.ItemEvent;
 import java.awt.event.ActionEvent;
+import java.awt.event.HierarchyEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -101,10 +107,14 @@ import javax.swing.WindowConstants;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
+import javax.swing.event.CaretEvent;
+import javax.swing.event.CaretListener;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.text.DefaultEditorKit;
 import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultCaret;
+import javax.swing.text.JTextComponent;
 import javax.swing.undo.UndoManager;
 
 public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, IExtensionStateListener {
@@ -479,6 +489,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private static final String SETTINGS_DIVIDER_MAIN = "burpnotes.divider.main";
     private static final String SETTINGS_UNLOAD_INACTIVE = "burpnotes.unloadInactiveTargets";
     private static final String SETTINGS_SHOW_OUTLINE = "burpnotes.showOutline";
+    private static final String SETTINGS_MANUAL_TARGETS = "burpnotes.manualTargets";
 
     private static final String NOTES_FILE_NAME = "notes.properties";
     private static final String ATTACHMENTS_DIR_NAME = "attachments";
@@ -536,17 +547,21 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private UndoManager notesUndoManager;
     private JEditorPane markdownPreview;
     private JTabbedPane notesEditorTabs;
+    private LineNumberView notesLineNumbers;
     private DefaultListModel<OutlineEntry> outlineListModel;
     private JList<OutlineEntry> outlineList;
     private Timer outlineUpdateTimer;
     private boolean outlineUpdating;
     private boolean showOutline = true;
+    private boolean outlineLayoutInitialized;
     private JLabel notesTargetLabel;
     private boolean previewDirty;
 
     private DefaultComboBoxModel<String> targetModel;
     private JComboBox<String> targetCombo;
     private JButton refreshTargetsButton;
+    private JTextField addTargetField;
+    private JButton addTargetButton;
 
     private JCheckBox autoSaveCheck;
     private JTextField storageDirectoryField;
@@ -592,6 +607,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private final Map<String, TargetState> targetStates = new HashMap<>();
     private final Set<String> globalTags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     private final Set<String> activeTagFilters = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+    private final Set<String> manualTargets = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     private String currentTarget;
     private String preferredTarget;
     private String storageDirectory;
@@ -647,7 +663,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         SwingUtilities.invokeLater(() -> {
             initTheme();
             loadGlobalSettings();
-            initPublicSuffixList();
             buildUi();
             callbacks.addSuiteTab(this);
             refreshTargets();
@@ -758,6 +773,16 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
         removeExcludedTags();
 
+        String manualSetting = callbacks.loadExtensionSetting(SETTINGS_MANUAL_TARGETS);
+        if (manualSetting != null && !manualSetting.trim().isEmpty()) {
+            for (String line : manualSetting.split("\\R")) {
+                String cleaned = normalizeTargetHost(safeTrim(line));
+                if (cleaned != null && !cleaned.isEmpty()) {
+                    manualTargets.add(cleaned);
+                }
+            }
+        }
+
         exportPath = safeTrim(callbacks.loadExtensionSetting(SETTINGS_EXPORT_PATH));
         if (exportPath.isEmpty()) {
             exportPath = getDefaultExportPath();
@@ -826,6 +851,17 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             sb.append(tag).append("\n");
         }
         callbacks.saveExtensionSetting(SETTINGS_TAG_FILTERS, sb.toString().trim());
+    }
+
+    private void saveManualTargets() {
+        if (callbacks == null) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String target : manualTargets) {
+            sb.append(target).append("\n");
+        }
+        callbacks.saveExtensionSetting(SETTINGS_MANUAL_TARGETS, sb.toString().trim());
     }
 
     private void saveExportPath() {
@@ -1152,6 +1188,13 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         publicSuffixList = PublicSuffixList.load();
     }
 
+    private void initPublicSuffixListIfNeeded() {
+        if (publicSuffixList != null && publicSuffixList.isLoaded()) {
+            return;
+        }
+        publicSuffixList = PublicSuffixList.load();
+    }
+
     private void buildUi() {
         rootPanel = new JPanel(new BorderLayout());
         rootPanel.setBackground(appBackground);
@@ -1380,12 +1423,23 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         content.add(tagChecklistScroll, BorderLayout.CENTER);
         content.add(actions, BorderLayout.SOUTH);
 
-        return createCollapsibleSectionPanel("Checklists", content, "checklists", false);
+        JButton infoButton = new JButton("i");
+        infoButton.setFont(bodyFont);
+        infoButton.setMargin(new Insets(2, 8, 2, 8));
+        infoButton.setFocusPainted(false);
+        infoButton.setForeground(accentColor);
+        infoButton.setBackground(blend(surfaceBackground, borderColor, 0.08f));
+        infoButton.setBorder(BorderFactory.createLineBorder(borderColor));
+        infoButton.setToolTipText("Checklist info");
+        infoButton.addActionListener(event -> showChecklistInfoFromSelection());
+
+        return createCollapsibleSectionPanel("Checklists", infoButton, content, "checklists", false);
     }
 
     private JPanel buildNotesEditorPanel() {
         JPanel content = new JPanel(new BorderLayout(0, 10));
         content.setBackground(surfaceBackground);
+        outlineLayoutInitialized = false;
 
         JLabel hint = new JLabel("Write notes in Markdown (.md) and preview them in the tab.");
         hint.setFont(bodyFont);
@@ -1396,9 +1450,10 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         notesArea.setWrapStyleWord(true);
         notesArea.setFont(monoFont);
         notesArea.setBackground(surfaceBackground);
-        notesArea.setCaretColor(accentColor);
+        notesArea.setCaretColor(getCaretHighlightColor());
         notesArea.setMargin(new Insets(8, 8, 8, 8));
         notesArea.setEnabled(false);
+        installEnhancedCaret(notesArea);
         installUndoRedo(notesArea);
         notesArea.getDocument().addDocumentListener(new SimpleDocumentListener(() -> {
             updateCurrentStateFromUi();
@@ -1412,6 +1467,8 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
         JScrollPane editorScroll = new JScrollPane(notesArea);
         editorScroll.setBorder(BorderFactory.createLineBorder(borderColor));
+        notesLineNumbers = new LineNumberView(notesArea);
+        editorScroll.setRowHeaderView(notesLineNumbers);
 
         markdownPreview = new JEditorPane();
         markdownPreview.setEditable(false);
@@ -1442,12 +1499,15 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         outlinePanel = buildOutlinePanel();
         outlinePlaceholder = new JPanel();
         outlinePlaceholder.setBackground(appBackground);
+        outlinePlaceholder.setPreferredSize(new Dimension(0, 0));
+        outlinePlaceholder.setMinimumSize(new Dimension(0, 0));
         notesEditorSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, notesEditorTabs, outlinePanel);
         notesEditorSplit.setResizeWeight(0.8);
         notesEditorSplit.setDividerSize(6);
         notesEditorSplit.setContinuousLayout(true);
         notesEditorSplit.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
         updateOutlineVisibility();
+        installOutlineLayoutFix();
 
         JPanel attachmentsPanel = buildAttachmentsPanel();
 
@@ -1456,6 +1516,27 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         content.add(attachmentsPanel, BorderLayout.SOUTH);
 
         return createSectionPanel("Notes", content);
+    }
+
+    private void installOutlineLayoutFix() {
+        if (notesEditorSplit == null || outlineLayoutInitialized) {
+            return;
+        }
+        outlineLayoutInitialized = true;
+        notesEditorSplit.addHierarchyListener(event -> {
+            if ((event.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) == 0) {
+                return;
+            }
+            if (!notesEditorSplit.isShowing()) {
+                return;
+            }
+            SwingUtilities.invokeLater(() -> {
+                applyOutlineDividerLocation(showOutline ? 0.78 : 1.0d);
+                if (notesEditorSplit != null) {
+                    notesEditorSplit.resetToPreferredSizes();
+                }
+            });
+        });
     }
 
     private JPanel buildOutlinePanel() {
@@ -1511,7 +1592,8 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             notesEditorSplit.setDividerSize(6);
             notesEditorSplit.setEnabled(true);
-            notesEditorSplit.setDividerLocation(0.78);
+            notesEditorSplit.setResizeWeight(0.8);
+            applyOutlineDividerLocation(0.78);
             if (outlineList != null) {
                 outlineList.setEnabled(currentTarget != null);
             }
@@ -1519,17 +1601,32 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             if (outlinePlaceholder == null) {
                 outlinePlaceholder = new JPanel();
                 outlinePlaceholder.setBackground(appBackground);
+                outlinePlaceholder.setPreferredSize(new Dimension(0, 0));
+                outlinePlaceholder.setMinimumSize(new Dimension(0, 0));
             }
             notesEditorSplit.setRightComponent(outlinePlaceholder);
-            notesEditorSplit.setDividerLocation(1.0d);
             notesEditorSplit.setDividerSize(0);
             notesEditorSplit.setEnabled(false);
+            notesEditorSplit.setResizeWeight(1.0);
+            applyOutlineDividerLocation(1.0d);
             if (outlineList != null) {
                 outlineList.setEnabled(false);
             }
         }
         notesEditorSplit.revalidate();
         notesEditorSplit.repaint();
+    }
+
+    private void applyOutlineDividerLocation(double proportional) {
+        if (notesEditorSplit == null) {
+            return;
+        }
+        notesEditorSplit.setDividerLocation(proportional);
+        SwingUtilities.invokeLater(() -> {
+            if (notesEditorSplit != null) {
+                notesEditorSplit.setDividerLocation(proportional);
+            }
+        });
     }
 
     private JPanel buildAttachmentsPanel() {
@@ -1578,6 +1675,45 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         panel.add(actions, BorderLayout.SOUTH);
 
         return panel;
+    }
+
+    private Color getCaretHighlightColor() {
+        Color base = accentColor == null ? new Color(80, 140, 220) : accentColor;
+        if (isDarkTheme) {
+            return blend(base, Color.WHITE, 0.55f);
+        }
+        return blend(base, Color.BLACK, 0.25f);
+    }
+
+    private void installEnhancedCaret(JTextArea area) {
+        if (area == null) {
+            return;
+        }
+        DefaultCaret caret = new DefaultCaret() {
+            @Override
+            public void paint(Graphics g) {
+                if (!isVisible()) {
+                    return;
+                }
+                JTextComponent component = getComponent();
+                if (component == null) {
+                    return;
+                }
+                try {
+                    Rectangle r = component.modelToView(getDot());
+                    if (r == null) {
+                        return;
+                    }
+                    g.setColor(component.getCaretColor());
+                    int width = 2;
+                    g.fillRect(r.x, r.y, width, r.height);
+                } catch (BadLocationException ignored) {
+                    // ignore invalid caret positions
+                }
+            }
+        };
+        caret.setBlinkRate(500);
+        area.setCaret(caret);
     }
 
     private void queueOutlineUpdate() {
@@ -1739,10 +1875,23 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         infoButton.setToolTipText("Recon and exploit notes");
         infoButton.addActionListener(event -> showCheatsheetInfo(entry));
 
-        JPanel header = new JPanel(new BorderLayout());
+        JPanel header = new JPanel(new GridBagLayout());
         header.setBackground(surfaceBackground);
-        header.add(title, BorderLayout.CENTER);
-        header.add(infoButton, BorderLayout.EAST);
+        GridBagConstraints titleConstraints = new GridBagConstraints();
+        titleConstraints.gridx = 0;
+        titleConstraints.gridy = 0;
+        titleConstraints.weightx = 1.0;
+        titleConstraints.fill = GridBagConstraints.HORIZONTAL;
+        titleConstraints.anchor = GridBagConstraints.WEST;
+
+        GridBagConstraints buttonConstraints = new GridBagConstraints();
+        buttonConstraints.gridx = 1;
+        buttonConstraints.gridy = 0;
+        buttonConstraints.weightx = 0.0;
+        buttonConstraints.anchor = GridBagConstraints.EAST;
+
+        header.add(title, titleConstraints);
+        header.add(infoButton, buttonConstraints);
 
         JTextArea body = new JTextArea(formatCheatsheetBullets(entry.getBullets()));
         body.setEditable(false);
@@ -1955,6 +2104,10 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         refreshTargetsButton.setFont(bodyFont);
         refreshTargetsButton.addActionListener(event -> refreshTargets());
 
+        JButton deleteTargetButton = new JButton("Delete Target");
+        deleteTargetButton.setFont(bodyFont);
+        deleteTargetButton.addActionListener(event -> deleteSelectedTargetFromUi());
+
         JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         row.setBackground(surfaceBackground);
         JLabel targetLabel = new JLabel("Target:");
@@ -1963,6 +2116,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         row.add(targetLabel);
         row.add(targetCombo);
         row.add(refreshTargetsButton);
+        row.add(deleteTargetButton);
 
         content.add(row);
         content.add(Box.createVerticalStrut(6));
@@ -1971,6 +2125,25 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         hint.setFont(bodyFont);
         hint.setForeground(mutedText);
         content.add(hint);
+
+        addTargetField = new JTextField(22);
+        addTargetField.setFont(bodyFont);
+        addTargetField.setPreferredSize(targetCombo.getPreferredSize());
+        addTargetField.setMinimumSize(targetCombo.getPreferredSize());
+        addTargetField.addActionListener(event -> addManualTarget());
+
+        addTargetButton = new JButton("Add Target");
+        addTargetButton.setFont(bodyFont);
+        addTargetButton.addActionListener(event -> addManualTarget());
+
+        JPanel addRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        addRow.setBackground(surfaceBackground);
+        addRow.add(new JLabel("Add:"));
+        addRow.add(addTargetField);
+        addRow.add(addTargetButton);
+
+        content.add(Box.createVerticalStrut(6));
+        content.add(addRow);
 
         return content;
     }
@@ -2523,6 +2696,10 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     }
 
     private JPanel createCollapsibleSectionPanel(String title, JPanel content, String key, boolean defaultCollapsed) {
+        return createCollapsibleSectionPanel(title, null, content, key, defaultCollapsed);
+    }
+
+    private JPanel createCollapsibleSectionPanel(String title, JComponent headerActions, JPanel content, String key, boolean defaultCollapsed) {
         JPanel panel = new JPanel(new BorderLayout());
         panel.setBackground(surfaceBackground);
         panel.setBorder(BorderFactory.createCompoundBorder(
@@ -2543,8 +2720,16 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         JPanel header = new JPanel(new BorderLayout());
         header.setBackground(surfaceBackground);
         header.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
+
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        right.setBackground(surfaceBackground);
+        if (headerActions != null) {
+            right.add(headerActions);
+        }
+        right.add(toggle);
+
         header.add(titleLabel, BorderLayout.WEST);
-        header.add(toggle, BorderLayout.EAST);
+        header.add(right, BorderLayout.EAST);
 
         content.setVisible(!collapsed);
         toggle.addActionListener(event -> {
@@ -2581,13 +2766,41 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     }
 
     private void refreshTargets() {
+        refreshTargetsAsync();
+    }
+
+    private void refreshTargetsAsync() {
+        if (isRefreshingTargets) {
+            return;
+        }
         isRefreshingTargets = true;
+        Thread worker = new Thread(() -> {
+            try {
+                initPublicSuffixListIfNeeded();
+                Set<String> targets = collectInScopeTargets();
+                targets = applyTagFilters(targets);
+                Set<String> finalTargets = targets;
+                SwingUtilities.invokeLater(() -> applyTargetsToUi(finalTargets));
+            } catch (RuntimeException e) {
+                if (callbacks != null) {
+                    callbacks.printError("Failed to refresh targets: " + e.getMessage());
+                }
+                SwingUtilities.invokeLater(() -> isRefreshingTargets = false);
+            }
+        }, "burp-notes-targets");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void applyTargetsToUi(Set<String> targets) {
+        if (targetModel == null || targetCombo == null) {
+            isRefreshingTargets = false;
+            return;
+        }
         try {
-            Set<String> targets = collectInScopeTargets();
-            targets = applyTagFilters(targets);
             targetModel.removeAllElements();
 
-            if (targets.isEmpty()) {
+            if (targets == null || targets.isEmpty()) {
                 targetModel.addElement(NO_TARGET);
                 targetCombo.setEnabled(false);
                 setCurrentTarget(null);
@@ -2617,6 +2830,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private Set<String> collectInScopeTargets() {
         Set<String> targets = new TreeSet<>();
         targets.addAll(collectTargetsFromScopeConfig());
+        targets.addAll(manualTargets);
 
         IHttpRequestResponse[] siteMap = callbacks.getSiteMap(null);
         if (siteMap == null) {
@@ -2851,6 +3065,10 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 notesEditorTabs.setEnabled(false);
                 markdownPreview.setText(renderMarkdownToHtml(""));
                 previewDirty = false;
+                if (notesLineNumbers != null) {
+                    notesLineNumbers.setEnabled(false);
+                    notesLineNumbers.repaint();
+                }
                 if (outlineList != null) {
                     outlineListModel.clear();
                     outlineList.setEnabled(false);
@@ -2899,6 +3117,10 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             resetUndoManager();
             previewDirty = true;
             syncMarkdownPreview();
+            if (notesLineNumbers != null) {
+                notesLineNumbers.setEnabled(true);
+                notesLineNumbers.repaint();
+            }
             if (outlineList != null) {
                 outlineList.setEnabled(true);
             }
@@ -2970,6 +3192,53 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             storageDirectory = updated;
             saveStorageDirectory();
         }
+    }
+
+    private void addManualTarget() {
+        if (addTargetField == null) {
+            return;
+        }
+        String input = safeTrim(addTargetField.getText());
+        if (input.isEmpty()) {
+            return;
+        }
+        String cleaned = normalizeTargetHost(input);
+        if (cleaned == null || cleaned.isEmpty()) {
+            if (callbacks != null) {
+                callbacks.issueAlert("Invalid target. Enter a base domain like example.com.");
+            }
+            return;
+        }
+        if (manualTargets.add(cleaned)) {
+            saveManualTargets();
+            refreshTargets();
+            if (targetCombo != null) {
+                targetCombo.setSelectedItem(cleaned);
+            }
+        }
+        addTargetField.setText("");
+    }
+
+    private void deleteSelectedTargetFromUi() {
+        if (targetCombo == null) {
+            return;
+        }
+        String selected = (String) targetCombo.getSelectedItem();
+        if (selected == null || NO_TARGET.equals(selected)) {
+            if (callbacks != null) {
+                callbacks.issueAlert("No target selected.");
+            }
+            return;
+        }
+        String message = "Delete target \"" + selected + "\" and its stored data?";
+        int result = JOptionPane.showConfirmDialog(rootPanel, message, "Delete Target",
+            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (result != JOptionPane.YES_OPTION) {
+            return;
+        }
+        manualTargets.remove(selected);
+        saveManualTargets();
+        deleteTargetData(selected);
     }
 
     private void updateExportPathFromUi() {
@@ -3974,6 +4243,70 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         tagChecklistContainer.add(empty);
         tagChecklistContainer.revalidate();
         tagChecklistContainer.repaint();
+    }
+
+    private void showChecklistInfoFromSelection() {
+        if (currentTarget == null) {
+            if (callbacks != null) {
+                callbacks.issueAlert("No target selected.");
+            }
+            return;
+        }
+        String tag = null;
+        if (tagList != null) {
+            List<String> selected = tagList.getSelectedValuesList();
+            if (selected.size() == 1) {
+                tag = selected.get(0);
+            }
+        }
+        if (tag == null) {
+            TagChecklistCard single = getSingleTagChecklistCard();
+            if (single != null) {
+                tag = single.getTagTitle();
+            }
+        }
+        if (tag == null || tag.trim().isEmpty()) {
+            if (callbacks != null) {
+                callbacks.issueAlert("Select a single tag to view checklist info.");
+            }
+            return;
+        }
+        CheatsheetEntry entry = CheatsheetLibrary.getEntryByTitle(tag);
+        if (entry == null) {
+            if (callbacks != null) {
+                callbacks.issueAlert("No cheatsheet info found for: " + tag);
+            }
+            return;
+        }
+        TargetState state = getOrCreateState(currentTarget);
+        List<String> items = buildChecklistItemsForTag(tag, state);
+        showChecklistInfo(tag, entry, items);
+    }
+
+    private TagChecklistCard getSingleTagChecklistCard() {
+        TagChecklistCard single = null;
+        for (TagChecklistCard card : checklistCards.values()) {
+            if (card == null || card.isCustomCard()) {
+                continue;
+            }
+            if (single != null) {
+                return null;
+            }
+            single = card;
+        }
+        return single;
+    }
+
+    private List<String> buildChecklistItemsForTag(String tag, TargetState state) {
+        List<String> items = new ArrayList<>(TagLibrary.getChecklistForTag(tag));
+        if (state != null && tag != null) {
+            String key = normalizeTagKey(tag);
+            List<String> customItems = state.customChecklistItems.get(key);
+            if (customItems != null && !customItems.isEmpty()) {
+                items.addAll(customItems);
+            }
+        }
+        return dedupeChecklistItems(items);
     }
 
     private void updateChecklistState(String tagKey) {
@@ -5209,6 +5542,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             notesUndoManager,
             markdownPreview,
             notesEditorTabs,
+            notesLineNumbers,
             notesTargetLabel,
             tagListModel,
             tagList,
@@ -5240,6 +5574,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         notesUndoManager = state.notesUndoManager;
         markdownPreview = state.markdownPreview;
         notesEditorTabs = state.notesEditorTabs;
+        notesLineNumbers = state.notesLineNumbers;
         notesTargetLabel = state.notesTargetLabel;
         tagListModel = state.tagListModel;
         tagList = state.tagList;
@@ -6821,8 +7156,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
     private final class TagChecklistCard extends JPanel {
         private final JPanel body;
-        private final JButton toggleButton;
-        private final JButton infoButton;
         private boolean collapsed;
         private final Map<String, JCheckBox> checkboxes = new LinkedHashMap<>();
         private final Runnable onChange;
@@ -6832,6 +7165,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         private final Consumer<String> onRemoveItem;
         private final Set<String> removableItems;
         private boolean updating;
+        private final String tagTitle;
 
         private TagChecklistCard(String tag,
                                  List<String> items,
@@ -6849,7 +7183,11 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             this.isCustomCard = isCustomCard;
             this.onRemoveItem = onRemoveItem;
             this.removableItems = removableItems == null ? new HashSet<>() : removableItems;
-            this.collapsed = state != null && state.collapsed;
+            this.tagTitle = tag == null ? "" : tag;
+            this.collapsed = false;
+            if (state != null) {
+                state.collapsed = false;
+            }
             setBackground(surfaceBackground);
             setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(borderColor),
@@ -6868,31 +7206,27 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             Dimension titleSize = title.getPreferredSize();
             title.setMinimumSize(new Dimension(0, titleSize.height));
 
-            toggleButton = new JButton(collapsed ? "+" : "-");
-            toggleButton.setFont(bodyFont);
-            toggleButton.setMargin(new Insets(2, 6, 2, 6));
-            toggleButton.addActionListener(event -> {
-                setCollapsed(!collapsed);
-                notifyChange();
-            });
-
-            infoButton = new JButton("i");
-            infoButton.setFont(bodyFont);
-            infoButton.setMargin(new Insets(2, 8, 2, 8));
-            infoButton.setFocusPainted(false);
-            infoButton.setForeground(accentColor);
-            infoButton.setBackground(blend(surfaceBackground, borderColor, 0.08f));
-            infoButton.setBorder(BorderFactory.createLineBorder(borderColor));
-            infoButton.addActionListener(event -> notifyInfo());
-
-            JPanel header = new JPanel(new BorderLayout());
+            JPanel header = new JPanel(new GridBagLayout());
             header.setBackground(surfaceBackground);
+
             JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
             right.setBackground(surfaceBackground);
-            right.add(infoButton);
-            right.add(toggleButton);
-            header.add(title, BorderLayout.CENTER);
-            header.add(right, BorderLayout.EAST);
+
+            GridBagConstraints titleConstraints = new GridBagConstraints();
+            titleConstraints.gridx = 0;
+            titleConstraints.gridy = 0;
+            titleConstraints.weightx = 1.0;
+            titleConstraints.fill = GridBagConstraints.HORIZONTAL;
+            titleConstraints.anchor = GridBagConstraints.WEST;
+
+            GridBagConstraints buttonConstraints = new GridBagConstraints();
+            buttonConstraints.gridx = 1;
+            buttonConstraints.gridy = 0;
+            buttonConstraints.weightx = 0.0;
+            buttonConstraints.anchor = GridBagConstraints.EAST;
+
+            header.add(title, titleConstraints);
+            header.add(right, buttonConstraints);
 
             body = new JPanel();
             body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
@@ -6925,23 +7259,23 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 }
             }
 
-            body.setVisible(!collapsed);
+            body.setVisible(true);
             add(header, BorderLayout.NORTH);
             add(body, BorderLayout.CENTER);
 
             installChecklistPopup(this);
         }
 
-        private void setCollapsed(boolean collapsed) {
-            this.collapsed = collapsed;
-            body.setVisible(!collapsed);
-            toggleButton.setText(collapsed ? "+" : "-");
-            revalidate();
-            repaint();
-        }
-
         private boolean isCollapsed() {
             return collapsed;
+        }
+
+        private boolean isCustomCard() {
+            return isCustomCard;
+        }
+
+        private String getTagTitle() {
+            return tagTitle;
         }
 
         private ChecklistItemState findItemState(TagChecklistState state, String item) {
@@ -7589,11 +7923,111 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
     }
 
+    private final class LineNumberView extends JComponent implements DocumentListener, CaretListener {
+        private static final int PADDING = 6;
+        private final JTextArea textArea;
+        private int currentDigits = 2;
+        private int currentLine = -1;
+
+        private LineNumberView(JTextArea textArea) {
+            this.textArea = textArea;
+            setFont(textArea.getFont());
+            setForeground(mutedText);
+            setBackground(blend(surfaceBackground, appBackground, 0.12f));
+            setOpaque(true);
+            setBorder(BorderFactory.createMatteBorder(0, 0, 0, 1, borderColor));
+            textArea.getDocument().addDocumentListener(this);
+            textArea.addCaretListener(this);
+            updateLineCount();
+        }
+
+        private void updateLineCount() {
+            int lines = Math.max(1, textArea.getLineCount());
+            int digits = Math.max(2, String.valueOf(lines).length());
+            if (digits != currentDigits) {
+                currentDigits = digits;
+                FontMetrics fm = getFontMetrics(getFont());
+                int width = PADDING * 2 + fm.charWidth('0') * currentDigits;
+                Dimension dim = new Dimension(width, Integer.MAX_VALUE);
+                setPreferredSize(dim);
+                setMinimumSize(new Dimension(width, 0));
+                revalidate();
+            }
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Rectangle clip = g.getClipBounds();
+            g.setColor(getBackground());
+            g.fillRect(clip.x, clip.y, clip.width, clip.height);
+            if (textArea == null) {
+                return;
+            }
+            FontMetrics fm = getFontMetrics(getFont());
+            int startOffset = textArea.viewToModel(new Point(0, clip.y));
+            int endOffset = textArea.viewToModel(new Point(0, clip.y + clip.height));
+            int startLine;
+            int endLine;
+            try {
+                startLine = textArea.getLineOfOffset(startOffset);
+                endLine = textArea.getLineOfOffset(endOffset);
+            } catch (BadLocationException e) {
+                return;
+            }
+
+            for (int line = startLine; line <= endLine; line++) {
+                try {
+                    int lineStart = textArea.getLineStartOffset(line);
+                    Rectangle r = textArea.modelToView(lineStart);
+                    if (r == null) {
+                        continue;
+                    }
+                    int y = r.y + r.height - fm.getDescent();
+                    String num = String.valueOf(line + 1);
+                    int x = getWidth() - PADDING - fm.stringWidth(num);
+                    boolean active = isEnabled() && line == currentLine;
+                    Color color = active ? accentColor : (isEnabled() ? mutedText : blend(mutedText, surfaceBackground, 0.4f));
+                    g.setColor(color);
+                    g.drawString(num, x, y);
+                } catch (BadLocationException ignored) {
+                    // skip invalid line
+                }
+            }
+        }
+
+        @Override
+        public void insertUpdate(DocumentEvent e) {
+            updateLineCount();
+        }
+
+        @Override
+        public void removeUpdate(DocumentEvent e) {
+            updateLineCount();
+        }
+
+        @Override
+        public void changedUpdate(DocumentEvent e) {
+            updateLineCount();
+        }
+
+        @Override
+        public void caretUpdate(CaretEvent e) {
+            try {
+                currentLine = textArea.getLineOfOffset(e.getDot());
+            } catch (BadLocationException ignored) {
+                currentLine = -1;
+            }
+            repaint();
+        }
+    }
+
     private static final class NotesViewState {
         private final JTextArea notesArea;
         private final UndoManager notesUndoManager;
         private final JEditorPane markdownPreview;
         private final JTabbedPane notesEditorTabs;
+        private final LineNumberView notesLineNumbers;
         private final JLabel notesTargetLabel;
         private final DefaultListModel<String> tagListModel;
         private final JList<String> tagList;
@@ -7619,6 +8053,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                                UndoManager notesUndoManager,
                                JEditorPane markdownPreview,
                                JTabbedPane notesEditorTabs,
+                               LineNumberView notesLineNumbers,
                                JLabel notesTargetLabel,
                                DefaultListModel<String> tagListModel,
                                JList<String> tagList,
@@ -7643,6 +8078,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             this.notesUndoManager = notesUndoManager;
             this.markdownPreview = markdownPreview;
             this.notesEditorTabs = notesEditorTabs;
+            this.notesLineNumbers = notesLineNumbers;
             this.notesTargetLabel = notesTargetLabel;
             this.tagListModel = tagListModel;
             this.tagList = tagList;
