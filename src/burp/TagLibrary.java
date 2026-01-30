@@ -566,6 +566,43 @@ final class TagLibrary {
         ));
 
         add(new TagDefinition(
+            "Cache Deception",
+            TagCategory.VULNERABILITY,
+            Arrays.asList(
+                "Identify authenticated pages that are cacheable by path rules.",
+                "Test static-extension tricks on sensitive pages (/.css, /.js).",
+                "Use path delimiters (;, /, ?) to reach the same handler.",
+                "Check cache hit headers (Age, X-Cache) after priming.",
+                "Fetch the primed URL as a different user or unauthenticated.",
+                "Confirm caches ignore or bypass Cookie/Authorization as expected."
+            ),
+            Arrays.asList(
+                "/account/profile.css",
+                "/settings;v1.js",
+                "/profile/?x=.css"
+            ),
+            true
+        ));
+
+        add(new TagDefinition(
+            "Request Smuggling",
+            TagCategory.VULNERABILITY,
+            Arrays.asList(
+                "Confirm a front-end proxy/CDN sits in front of the origin.",
+                "Test TE.CL and CL.TE with ambiguous headers.",
+                "Try duplicate Content-Length headers with different values.",
+                "Look for desync signs: hangs, odd status, response queueing.",
+                "Verify impact on next request (auth bypass, cache poisoning).",
+                "Focus on HTTP/1.1 keep-alive and connection reuse behavior."
+            ),
+            Arrays.asList(
+                "Transfer-Encoding: chunked + Content-Length: 4",
+                "Two Content-Length headers with different values"
+            ),
+            true
+        ));
+
+        add(new TagDefinition(
             "WSS (WebSocket Secure)",
             TagCategory.VULNERABILITY,
             Arrays.asList(
