@@ -696,6 +696,46 @@ final class CheatsheetLibrary {
                 + "Show a clean reproduction path and emphasize user impact."
         ),
         new CheatsheetEntry(
+            "Cache Deception",
+            Arrays.asList(
+                "Find sensitive pages cacheable by path or extension rules.",
+                "Prime caches with authenticated content.",
+                "Verify unauth users can fetch cached responses."
+            ),
+            "Identify sensitive endpoints behind auth that might be cached due to path or extension rules. "
+                + "Check if caching is based on URL patterns rather than auth context.\n"
+                + "- Dynamic pages with static extensions\n"
+                + "- CDN rules that ignore cookies\n"
+                + "- Cache headers that allow storage",
+            "Prime the cache using an authenticated session and an extension-based path. "
+                + "Observe Age/X-Cache headers and confirm storage.\n"
+                + "- /account/profile.css\n"
+                + "- /settings;v1.js\n"
+                + "- /profile/?x=.css",
+            "Fetch the same URL as an unauthenticated or different user to prove data exposure. "
+                + "Document caching indicators and the exact URL pattern used."
+        ),
+        new CheatsheetEntry(
+            "Request Smuggling",
+            Arrays.asList(
+                "Confirm a proxy/CDN + origin chain exists.",
+                "Test TE.CL and CL.TE desync patterns.",
+                "Verify impact on subsequent requests."
+            ),
+            "Identify deployments where a front-end proxy/CDN forwards requests to a back-end origin. "
+                + "Request smuggling typically requires different parsing between layers.\n"
+                + "- CDN / reverse proxy in front of origin\n"
+                + "- HTTP/1.1 keep-alive connections\n"
+                + "- Mixed Transfer-Encoding and Content-Length handling",
+            "Send ambiguous requests to reveal parsing mismatches. "
+                + "Look for timeouts, response splitting, or queued responses.\n"
+                + "- TE.CL vs CL.TE patterns\n"
+                + "- Duplicate Content-Length headers\n"
+                + "- Whitespace/case variations",
+            "Demonstrate a safe impact such as response desync or cache poisoning without causing disruption. "
+                + "Document connection reuse behavior and affected endpoints."
+        ),
+        new CheatsheetEntry(
             "WSS (WebSocket Secure)",
             Arrays.asList(
                 "Enumerate WS endpoints and message types.",
