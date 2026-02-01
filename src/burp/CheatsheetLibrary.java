@@ -8,23 +8,26 @@ final class CheatsheetLibrary {
         new CheatsheetEntry(
             "Business Logic",
             Arrays.asList(
-                "Map critical flows and state transitions.",
-                "Try step skipping, order changes, and replay.",
-                "Manipulate price/quantity/currency/discount fields.",
-                "Check server-side recalculation and idempotency."
+                "Map critical flows, state transitions, and invariants.",
+                "Test step skipping, order changes, and replay behavior.",
+                "Tamper client-controlled values (totals, discounts, shipping, currency).",
+                "Check idempotency for finalize/refund/coupon redemption.",
+                "Abuse rate limits/quotas on costly actions (emails, exports, credits).",
+                "Probe object state manipulation via hidden fields/flags."
             ),
-            "Look for multi-step workflows where the client controls totals, status, refunds, or approvals. "
-                + "Identify hidden fields, client-side validation, or state transitions that are not rechecked server-side.\n"
+            "Identify workflows with multi‑step transitions, approvals, or irreversible actions. "
+                + "Focus on money/credit, inventory, permissions, and costly operations where business rules matter.\n"
                 + "- Checkout, refunds, account changes\n"
                 + "- Coupons, credits, shipping, inventory\n"
                 + "- Approval or review steps",
-            "Map every step and capture the exact requests and responses. "
-                + "Track how state changes across steps and which parameters are trusted.\n"
-                + "- Compare UI state vs server-side response\n"
-                + "- Note idempotency tokens and order IDs\n"
-                + "- Look for missing server recomputation",
-            "Modify parameters (price/qty), skip steps, or replay finalize/refund to exceed limits or bypass checks. "
-                + "Try out-of-order transitions and parallel submissions to break invariants."
+            "Capture each request/response and map the exact allowed state transitions. "
+                + "Note invariants (totals, limits, ownership) and any client‑controlled fields or hidden flags.\n"
+                + "- Compare UI totals vs server‑side recomputation\n"
+                + "- Track idempotency tokens and order IDs\n"
+                + "- Check rate limits/quotas on expensive actions",
+            "Try skipping steps, reordering transitions, and replaying finalize/refund actions. "
+                + "Tamper totals/coupons/currency/quantity, and use parallel submissions to break invariants. "
+                + "Look for quota bypass (e.g., repeated exports, credits, or emails)."
         ),
         new CheatsheetEntry(
             "SQL Injection",
@@ -51,7 +54,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Identify context: HTML, attribute, JS, URL, CSS.",
                 "Test reflected, stored, and DOM sinks.",
-                "Check CSP and encoding behavior."
+                "Check CSP and encoding behavior.",
+                "Audit postMessage handlers and JSON.parse on untrusted data.",
+                "Test javascript: URLs and fragment-based DOM injection."
             ),
             "Identify reflections and sinks: templated output, DOM updates, or stored content. "
                 + "Look for places where user input is rendered without proper encoding.\n"
@@ -71,7 +76,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Use parallel requests on non-atomic actions.",
                 "Look for double-spend or duplicate submissions.",
-                "Check idempotency token handling."
+                "Check idempotency token handling.",
+                "Race multi-endpoint flows (add-to-cart + checkout).",
+                "Probe verification flows (email/phone) for mis-binding."
             ),
             "Identify actions that should be atomic or single-use: balances, inventory, coupons, refunds, or approvals. "
                 + "Look for missing idempotency keys or locks.\n"
@@ -132,6 +139,7 @@ final class CheatsheetLibrary {
                 "Normalize responses to prevent user enumeration.",
                 "Verify reset tokens are random, single-use, and short-lived.",
                 "Send parallel reset requests to ensure tokens are unique.",
+                "Test for token collisions across sessions or timestamps.",
                 "Ensure reset links use a trusted host and safe redirects.",
                 "Require re-login and invalidate old sessions.",
                 "Rate limit reset requests to prevent abuse."
@@ -195,7 +203,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Find URL fetchers (webhooks/importers/PDF).",
                 "Test internal IPs and metadata services.",
-                "Try redirect or DNS rebinding bypass."
+                "Try redirect or DNS rebinding bypass.",
+                "Probe Host header/absolute-URL parsing quirks.",
+                "Check OAuth/OpenID dynamic registration fields (logo_uri/jwks_uri)."
             ),
             "Identify features that fetch URLs: webhooks, importers, image fetch, PDF generation, link previews. "
                 + "Confirm which protocols and redirects are allowed.\n"
@@ -213,9 +223,10 @@ final class CheatsheetLibrary {
         new CheatsheetEntry(
             "Cross-Site Request Forgery (CSRF)",
             Arrays.asList(
-                "Check state-changing endpoints for tokens.",
-                "Verify SameSite and Origin/Referer checks.",
-                "Look for GET actions that change state."
+                "Check state-changing endpoints for tokens (forms/JSON/GraphQL).",
+                "Verify tokens are tied to session/user and not reusable.",
+                "Test SameSite and Origin/Referer checks and common bypasses.",
+                "Look for GET actions or method overrides that change state."
             ),
             "Identify state-changing endpoints that rely on cookies without CSRF defenses. "
                 + "Look for missing tokens or weak origin validation.\n"
@@ -295,6 +306,7 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Check XML parsers (SOAP/SAML/SVG).",
                 "Test external entity resolution.",
+                "Try XInclude or external DTD OOB exfiltration.",
                 "Confirm secure parser settings."
             ),
             "Identify any XML input handling: SOAP, SAML, XML uploads, or SVG parsing. "
@@ -315,6 +327,7 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Probe with {{7*7}} or ${7*7}.",
                 "Identify template contexts in emails/pages.",
+                "Fingerprint template engine and context.",
                 "Check sandbox escape."
             ),
             "Identify where user input is rendered in templates: emails, PDFs, reports, or UI fragments. "
@@ -395,7 +408,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Validate redirect_uri allowlist.",
                 "Ensure state parameter is required.",
-                "Test open redirect chaining."
+                "Test open redirect chaining.",
+                "Check account linking endpoints for CSRF/forced linking.",
+                "Verify auth code is bound to client and redirect_uri."
             ),
             "Identify OAuth/OIDC flows and callback endpoints. "
                 + "Look for missing state/PKCE or weak redirect validation.\n"
@@ -414,7 +429,8 @@ final class CheatsheetLibrary {
             "Clickjacking",
             Arrays.asList(
                 "Check X-Frame-Options / frame-ancestors.",
-                "Test sensitive pages in iframe."
+                "Test sensitive pages in iframe.",
+                "Bypass frame-busting scripts with sandboxed iframes."
             ),
             "Identify sensitive pages without frame protection. "
                 + "Check headers and CSP frame-ancestors.\n"
@@ -434,7 +450,8 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Attempt slow credential stuffing.",
                 "Check lockout and throttling.",
-                "Look for user enumeration."
+                "Look for user enumeration.",
+                "Test lockout reset via successful logins or IP rotation."
             ),
             "Identify endpoints that should be rate-limited: login, OTP, password reset, API keys. "
                 + "Look for differences that allow enumeration.\n"
@@ -474,7 +491,8 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Identify serialized blobs (Java/PHP).",
                 "Check gadget chains and type controls.",
-                "Verify integrity protections."
+                "Verify integrity protections.",
+                "Modify object properties or types to bypass logic."
             ),
             "Identify serialized payloads: base64 blobs, magic bytes, or framework markers. "
                 + "Look for untrusted input reaching deserializers.\n"
@@ -494,7 +512,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Find deep-merge of user input (JSON/query/body).",
                 "Test __proto__ and constructor.prototype payloads.",
-                "Confirm impact via inherited property changes."
+                "Confirm impact via inherited property changes.",
+                "Try alternate vectors in URL-encoded params and arrays.",
+                "Check for client-side DOM sinks using polluted props."
             ),
             "Identify endpoints that accept object-like input and merge it into server-side options. "
                 + "Look for JSON bodies, query params, or URL-encoded objects that are deep-merged.\n"
@@ -679,6 +699,7 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Identify cacheable endpoints and shared caches.",
                 "Test cache key variance on headers and query params.",
+                "Look for unkeyed headers/cookies reflected in responses.",
                 "Try extension and delimiter tricks on dynamic pages.",
                 "Confirm poisoned cache is served to unauthenticated users."
             ),
@@ -720,7 +741,9 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Confirm a proxy/CDN + origin chain exists.",
                 "Test TE.CL and CL.TE desync patterns.",
-                "Verify impact on subsequent requests."
+                "Verify impact on subsequent requests.",
+                "Use differential 404/redirects to confirm desync.",
+                "Check HTTP/2 downgrade (H2.TE) for queue poisoning."
             ),
             "Identify deployments where a front-end proxy/CDN forwards requests to a back-end origin. "
                 + "Request smuggling typically requires different parsing between layers.\n"
@@ -740,8 +763,10 @@ final class CheatsheetLibrary {
             Arrays.asList(
                 "Enumerate WS endpoints and message types.",
                 "Verify auth and role checks per message.",
+                "Check Origin validation and cross-site hijacking risks.",
                 "Test replay and token reuse after logout.",
                 "Check for IDOR in payload fields.",
+                "Tamper messages to bypass client-side encoding/filters.",
                 "Validate rate limits and payload size handling."
             ),
             "Identify WebSocket connections, upgrade requests, and message schemas. "

@@ -12,22 +12,43 @@ import java.util.Map;
 final class TagLibrary {
     private static final Map<String, TagDefinition> TAGS = new LinkedHashMap<>();
     private static final Map<String, TagDefinition> TAGS_LOWER = new HashMap<>();
+    private static final Object LOCK = new Object();
+    private static boolean loaded;
 
-    static {
+    static boolean isLoaded() {
+        return loaded;
+    }
+
+    private static void ensureLoaded() {
+        if (loaded) {
+            return;
+        }
+        synchronized (LOCK) {
+            if (loaded) {
+                return;
+            }
+            loadTags();
+            loaded = true;
+        }
+    }
+
+    private static void loadTags() {
         add(new TagDefinition(
             "Business Logic",
             TagCategory.VULNERABILITY,
             Arrays.asList(
-                "Map the full flow and the server-side state changes.",
-                "Skip steps or change order; does the server enforce state?",
-                "Manipulate price/quantity/coupon/currency values.",
-                "Replay confirmation or refund requests.",
-                "Check idempotency and rate limits."
+                "Map critical flows, state transitions, and invariants (price, balance, inventory).",
+                "Attempt step skipping or out-of-order completion; verify server-enforced sequencing.",
+                "Tamper with client-controlled values (totals, discounts, shipping, currency, quantity).",
+                "Replay or re-submit finalize/refund/coupon actions; verify idempotency.",
+                "Check object state manipulation (hidden flags, role fields, internal statuses).",
+                "Probe rate limits/quotas on costly actions (exports, emails, SMS, credits)."
             ),
             Arrays.asList(
-                "Try a checkout with a modified total (client vs server).",
-                "Replay the finalization request multiple times.",
-                "Submit requests out of order."
+                "Modify totals after client-side calculation and re-submit.",
+                "Replay checkout/settlement requests to duplicate credits or orders.",
+                "Race refund + cancel to trigger double credits.",
+                "Apply coupons in the wrong sequence or after step changes."
             ),
             true
         ));
@@ -59,6 +80,9 @@ final class TagLibrary {
             Arrays.asList(
                 "Identify context (HTML, attribute, JS string, URL, CSS).",
                 "Test reflected, stored, and DOM sinks.",
+                "Audit postMessage handlers for origin checks and unsafe sinks.",
+                "Test DOM XSS via JSON.parse or message data (untrusted objects).",
+                "Check javascript: URLs and URL fragment-based injection.",
                 "Check output encoding and CSP behavior.",
                 "Try context-specific payloads (event handlers, SVG, JS).",
                 "Test attribute breaking and quote handling.",
@@ -76,11 +100,14 @@ final class TagLibrary {
             "Race Condition",
             TagCategory.VULNERABILITY,
             Arrays.asList(
-                "Send the request to Repeater, create a group with 5 requests, send them in parallel, does it exceed limits?",
-                "Look for non-atomic actions (balance, inventory, coupon).",
-                "Check for duplicate submissions and double-spend.",
-                "Look for missing idempotency tokens.",
-                "Try mixed ordering and quick retries to bypass rate limits."
+                "Run parallel request groups against single-use or atomic actions; compare success vs limit enforcement.",
+                "Target multi-endpoint sequences (add-to-cart + checkout, coupon apply + checkout) in parallel.",
+                "Race verification flows (email/phone change) to mis-bind tokens or confirmations.",
+                "Check for non-atomic actions (balance, inventory, coupon) and partial updates.",
+                "Look for duplicate submissions and double-spend behavior.",
+                "Verify idempotency keys/locks are enforced on repeats.",
+                "Bypass per-session locking by using multiple sessions in parallel.",
+                "Test time-based token collisions in reset/verification flows."
             ),
             Arrays.asList(
                 "Use Turbo Intruder / parallel requests.",
@@ -113,7 +140,8 @@ final class TagLibrary {
                 "Sessions invalidated on logout/reset/password change.",
                 "Session ID changes on login (fixation check).",
                 "MFA enforced on sensitive actions.",
-                "Rate limiting and lockout defenses."
+                "Rate limiting and lockout defenses.",
+                "Inspect remember-me/stay-logged-in cookies for predictability or weak hashing."
             ),
             Arrays.asList(
                 "Try reusing password reset tokens.",
@@ -128,13 +156,15 @@ final class TagLibrary {
             Arrays.asList(
                 "Check reset token randomness, length, and expiration.",
                 "Send parallel reset requests; ensure tokens are unique and old ones invalidated.",
+                "Issue reset requests from different sessions to spot timestamp-based token collisions.",
                 "Verify tokens are single-use and invalidated after reset.",
+                "Check token binding to account (swap user/email parameter).",
                 "Test for user enumeration in reset requests.",
                 "Check reset flow enforces rate limits and CAPTCHA.",
                 "Attempt reuse of old reset links after password change.",
                 "Test reset link host/header poisoning and open redirects.",
                 "Verify reset does not log user in without reauth.",
-                "Check reset works only for the intended user.",
+                "Ensure reset tokens are not leaked via Referer/logs.",
                 "Test for CSRF on reset completion endpoints."
             ),
             Arrays.asList(
@@ -248,7 +278,8 @@ final class TagLibrary {
             Arrays.asList(
                 "Check weak password policy.",
                 "Verify MFA is required where needed.",
-                "Ensure brute-force protections exist."
+                "Ensure brute-force protections exist.",
+                "Look for username enumeration via subtle response or timing differences."
             ),
             Arrays.asList(
                 "Try credential stuffing with slow ramp.",
@@ -295,7 +326,10 @@ final class TagLibrary {
                 "Test internal IPs and metadata services.",
                 "Try alternative IP formats (hex, decimal, octal).",
                 "Bypass filters with redirects or DNS rebinding.",
-                "Test HTTP and non-HTTP schemes if supported."
+                "Test HTTP and non-HTTP schemes if supported.",
+                "Probe routing-based SSRF via Host/X-Forwarded-Host and absolute URL requests.",
+                "Test URL parser confusion (userinfo @, fragments, mixed slashes).",
+                "Check OAuth/OpenID dynamic registration fields (logo_uri, jwks_uri) for SSRF."
             ),
             Arrays.asList(
                 "http://169.254.169.254/latest/meta-data/",
@@ -308,11 +342,13 @@ final class TagLibrary {
             "Cross-Site Request Forgery (CSRF)",
             TagCategory.VULNERABILITY,
             Arrays.asList(
-                "Check state-changing endpoints.",
-                "Verify CSRF tokens on POST/PUT/PATCH.",
-                "Check SameSite cookie flags.",
-                "Verify Origin/Referer validation.",
-                "Test token reuse and missing token enforcement.",
+                "Cover state-changing endpoints across form, JSON, and GraphQL.",
+                "Ensure tokens are tied to the active session/user (no cross-account reuse).",
+                "Test double-submit patterns: token duplicated in cookie or non-session cookie.",
+                "Reject requests when token is missing, blank, or malformed.",
+                "Verify token checks are not bypassed via method override or content-type changes.",
+                "Probe SameSite bypasses via top-level redirects and sibling subdomains.",
+                "Test Origin/Referer validation for missing headers and weak allowlists.",
                 "Check GET endpoints that change state."
             ),
             Arrays.asList(
@@ -364,6 +400,9 @@ final class TagLibrary {
             Arrays.asList(
                 "Locate XML parsers (SOAP/SAML/SVG/Docx).",
                 "Test inline DTD with external entity.",
+                "Test parameter entities and external DTDs for OOB exfil.",
+                "Try XInclude payloads in XML or SVG.",
+                "Check file uploads (SVG/Docx) for XXE vectors.",
                 "Confirm external entity resolution disabled."
             ),
             Arrays.asList(
@@ -377,8 +416,10 @@ final class TagLibrary {
             TagCategory.VULNERABILITY,
             Arrays.asList(
                 "Probe with simple arithmetic payloads.",
-                "Identify template contexts in emails/pages.",
-                "Check for sandbox escape."
+                "Fingerprint the template engine and rendering context.",
+                "Identify template contexts in emails/pages/reports.",
+                "Test object traversal for config/env disclosure.",
+                "Check for sandbox escape primitives."
             ),
             Arrays.asList(
                 "{{7*7}}", "${7*7}", "<%= 7*7 %>"
@@ -434,7 +475,10 @@ final class TagLibrary {
             Arrays.asList(
                 "Validate redirect_uri allowlist.",
                 "Ensure state parameter is required.",
-                "Check for open redirect chaining."
+                "Check for open redirect chaining.",
+                "Test account linking endpoints for missing state/CSRF (forced linking).",
+                "Ensure auth codes are bound to correct client and redirect_uri.",
+                "Require re-auth for linking/unlinking and sensitive SSO actions."
             ),
             Arrays.asList(
                 "Try redirect_uri=https://evil.com"
@@ -448,7 +492,8 @@ final class TagLibrary {
             Arrays.asList(
                 "Check X-Frame-Options / frame-ancestors.",
                 "Test sensitive pages in an iframe.",
-                "Look for UI redress on critical actions."
+                "Look for UI redress on critical actions.",
+                "Bypass frame-busting scripts with sandboxed iframes."
             ),
             Arrays.asList(
                 "Create a PoC iframe on attacker page"
@@ -463,7 +508,9 @@ final class TagLibrary {
                 "Test brute force with slow ramp.",
                 "Check account lockout and cooldown.",
                 "Verify CAPTCHA/bot protection.",
-                "Check for username enumeration."
+                "Check for username enumeration.",
+                "See if successful login resets the lockout counter (interleaving valid creds).",
+                "Bypass IP throttles via X-Forwarded-For or alternate endpoints."
             ),
             Arrays.asList(
                 "Attempt credential stuffing"
@@ -492,6 +539,9 @@ final class TagLibrary {
                 "Identify serialized blobs (Java/PHP/.NET) and magic bytes.",
                 "Check whether input reaches deserializers directly.",
                 "Verify integrity protections (HMAC/signature).",
+                "Modify serialized properties/IDs to change authorization logic.",
+                "Change data types (int/string/boolean) to trigger logic flaws.",
+                "Look for base64/URL-encoded serialized data in cookies/headers.",
                 "Test type restrictions and class allowlists.",
                 "Look for known gadget chains for the stack.",
                 "Check error messages for class names or stack traces.",
@@ -510,9 +560,11 @@ final class TagLibrary {
                 "Identify endpoints that deep-merge user input into objects.",
                 "Test JSON bodies for __proto__ or constructor.prototype keys.",
                 "Test URL-encoded params like __proto__[polluted]=yes.",
-                "Confirm pollution by checking for shared properties or behavior changes.",
+                "Try alternate vectors (constructor[prototype], arrays, nested objects).",
+                "Detect pollution without reflection by checking behavior changes.",
                 "Look for auth/role checks that rely on inherited properties.",
                 "Check for gadget sinks (template options, file paths, command exec).",
+                "Test client-side sinks (DOM XSS) via polluted properties.",
                 "Verify impact persists across requests (global prototype).",
                 "Ensure app uses allowlists/hasOwnProperty protections."
             ),
@@ -553,6 +605,9 @@ final class TagLibrary {
                 "Identify cacheable endpoints and confirm cache headers (Cache-Control, Age, X-Cache).",
                 "Check whether authenticated responses are cached and shared.",
                 "Test cache key variance on headers (Host, X-Forwarded-Host, X-Original-URL).",
+                "Look for unkeyed headers or cookies reflected into responses.",
+                "Test multiple header interactions (X-Forwarded-Host + X-Forwarded-Scheme).",
+                "Use Param Miner/guess headers to discover hidden inputs and check Vary.",
                 "Try static extensions on dynamic pages (.js, .css, .png).",
                 "Use path delimiters (? ; /) to force cacheable variants.",
                 "Confirm a victim can retrieve poisoned content without auth."
@@ -593,7 +648,11 @@ final class TagLibrary {
                 "Try duplicate Content-Length headers with different values.",
                 "Look for desync signs: hangs, odd status, response queueing.",
                 "Verify impact on next request (auth bypass, cache poisoning).",
-                "Focus on HTTP/1.1 keep-alive and connection reuse behavior."
+                "Focus on HTTP/1.1 keep-alive and connection reuse behavior.",
+                "Use differential responses (smuggle /404) to confirm desync.",
+                "Test HTTP/2 downgrade paths (H2.TE) for response queue poisoning.",
+                "Check for front-end request rewriting by smuggling unique headers.",
+                "Attempt to capture or influence other users' requests."
             ),
             Arrays.asList(
                 "Transfer-Encoding: chunked + Content-Length: 4",
@@ -608,9 +667,12 @@ final class TagLibrary {
             Arrays.asList(
                 "Enumerate WebSocket endpoints and message types.",
                 "Verify auth/role enforcement on every message type.",
+                "Check Origin validation to prevent cross-site WebSocket hijacking.",
                 "Test replay of captured messages after logout or removal.",
                 "Check IDOR in message payloads (user_id, connection_id).",
                 "Attempt privilege escalation via role change messages.",
+                "Tamper WebSocket messages to bypass client-side encoding/filters.",
+                "Manipulate handshake headers (X-Forwarded-For) to bypass IP bans.",
                 "Validate server-side input validation and rate limits.",
                 "Check for information leaks in broadcast messages."
             ),
@@ -756,10 +818,12 @@ final class TagLibrary {
     }
 
     static List<String> getAllTagNames() {
+        ensureLoaded();
         return new ArrayList<>(TAGS.keySet());
     }
 
     static TagDefinition getDefinition(String tag) {
+        ensureLoaded();
         if (tag == null) {
             return null;
         }
@@ -771,6 +835,7 @@ final class TagLibrary {
     }
 
     static List<String> getChecklistForTag(String tag) {
+        ensureLoaded();
         TagDefinition def = getDefinition(tag);
         if (def == null) {
             return Collections.emptyList();

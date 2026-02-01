@@ -19,7 +19,6 @@ import java.awt.RenderingHints;
 import java.awt.Rectangle;
 import java.awt.Point;
 import java.awt.Toolkit;
-import java.awt.KeyboardFocusManager;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.Transferable;
@@ -76,6 +75,7 @@ import javax.swing.BoxLayout;
 import javax.swing.DefaultComboBoxModel;
 import javax.swing.DefaultListModel;
 import javax.swing.DefaultListCellRenderer;
+import javax.swing.DefaultListSelectionModel;
 import javax.swing.AbstractAction;
 import javax.swing.Action;
 import javax.swing.JButton;
@@ -98,6 +98,7 @@ import javax.swing.JPopupMenu;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.KeyStroke;
+import javax.swing.ListCellRenderer;
 import javax.swing.ListSelectionModel;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingUtilities;
@@ -556,6 +557,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private boolean outlineLayoutInitialized;
     private JLabel notesTargetLabel;
     private boolean previewDirty;
+    private int previewRenderToken;
 
     private DefaultComboBoxModel<String> targetModel;
     private JComboBox<String> targetCombo;
@@ -574,6 +576,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private JScrollPane tagChecklistScroll;
     private JTextField addChecklistItemField;
     private JButton addChecklistButton;
+    private TagListCellRenderer tagListCellRenderer;
     private final Map<String, TagChecklistCard> checklistCards = new HashMap<>();
     private JDialog searchDialog;
     private JTextField searchDialogField;
@@ -645,8 +648,15 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
     private Timer autoSaveTimer;
     private java.util.concurrent.ExecutorService saveExecutor;
+    private java.util.concurrent.ExecutorService backgroundExecutor;
     private PublicSuffixList publicSuffixList;
-    private boolean searchDispatcherInstalled;
+    private volatile boolean extensionActive;
+
+    private JPanel cheatsheetListPanel;
+    private JScrollPane cheatsheetScrollPane;
+    private JLabel cheatsheetLoadingLabel;
+    private boolean cheatsheetLoaded;
+    private int cheatsheetTabIndex = -1;
 
     private boolean tagsCollapsed;
     private boolean checklistsCollapsed;
@@ -659,6 +669,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         callbacks.setExtensionName(EXTENSION_NAME);
         callbacks.registerScopeChangeListener(this);
         callbacks.registerExtensionStateListener(this);
+        extensionActive = true;
 
         SwingUtilities.invokeLater(() -> {
             initTheme();
@@ -666,6 +677,8 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             buildUi();
             callbacks.addSuiteTab(this);
             refreshTargets();
+            ensureSampleNotesAsync();
+            loadDefaultTagsAsync();
         });
     }
 
@@ -686,11 +699,13 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
     @Override
     public void extensionUnloaded() {
+        extensionActive = false;
         SwingUtilities.invokeLater(() -> {
             cancelAutoSave();
             stopMemoryUsageTimer();
             flushAllState();
             shutdownSaveExecutor();
+            shutdownBackgroundExecutor();
         });
     }
 
@@ -744,7 +759,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 }
             }
         }
-        globalTags.addAll(TagLibrary.getAllTagNames());
         removeExcludedTags();
 
         String last = safeTrim(callbacks.loadExtensionSetting(SETTINGS_LAST_TARGET));
@@ -810,7 +824,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             showOutline = Boolean.parseBoolean(outlineSetting);
         }
 
-        ensureSampleNotes();
     }
 
     private void saveGlobalTags() {
@@ -951,6 +964,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         props.setProperty("notes", encodeBase64(SAMPLE_NOTES));
         props.setProperty("autoSave", "false");
         props.setProperty("tags", "");
+        props.setProperty("naTags", "");
         props.setProperty("attachments", "");
         props.setProperty("checklists", "");
         props.setProperty("customChecklistItems", "");
@@ -963,6 +977,16 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 callbacks.printError("Failed to write sample notes: " + e.getMessage());
             }
         }
+    }
+
+    private void ensureSampleNotesAsync() {
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            ensureSampleNotes();
+        });
     }
 
     private void startMemoryUsageTimer() {
@@ -1016,6 +1040,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             total += approxStringBytes(state.notesText);
             for (String tag : state.selectedTags) {
+                total += approxStringBytes(tag);
+            }
+            for (String tag : state.notApplicableTags) {
                 total += approxStringBytes(tag);
             }
             for (String name : state.attachments) {
@@ -1206,9 +1233,20 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         tabbedPane.addTab("Options", buildOptionsPanel());
 
         rootPanel.add(tabbedPane, BorderLayout.CENTER);
-        registerSearchHotkey(rootPanel);
-        installGlobalSearchDispatcher();
         customizeRecursive(rootPanel);
+        applyTagListRenderer();
+
+        cheatsheetTabIndex = tabbedPane.indexOfTab("Cheatsheet");
+        tabbedPane.addChangeListener(event -> {
+            if (tabbedPane.getSelectedIndex() == cheatsheetTabIndex) {
+                loadCheatsheetIfNeeded();
+            }
+        });
+        SwingUtilities.invokeLater(() -> {
+            if (tabbedPane.getSelectedIndex() == cheatsheetTabIndex) {
+                loadCheatsheetIfNeeded();
+            }
+        });
     }
 
     private void customizeRecursive(Component component) {
@@ -1262,7 +1300,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         });
 
         panel.add(notesMainSplitPane, BorderLayout.CENTER);
-        registerSearchHotkey(panel);
         return panel;
     }
 
@@ -1349,15 +1386,19 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
         tagList = new JList<>(tagListModel);
         tagList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        tagList.setSelectionModel(new LockedTagSelectionModel());
         tagList.setVisibleRowCount(10);
         tagList.setFont(bodyFont);
         tagList.setBackground(surfaceBackground);
+        tagListCellRenderer = new TagListCellRenderer(tagList.getCellRenderer());
+        tagList.setCellRenderer(tagListCellRenderer);
         tagList.setEnabled(false);
         tagList.addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting()) {
                 updateCurrentTagsFromUi();
             }
         });
+        installTagListPopup();
 
         initDefaultTags();
 
@@ -1826,24 +1867,70 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         header.add(textPanel, BorderLayout.WEST);
         panel.add(header, BorderLayout.NORTH);
 
-        JPanel listPanel = new JPanel();
-        listPanel.setLayout(new BoxLayout(listPanel, BoxLayout.Y_AXIS));
-        listPanel.setBackground(appBackground);
+        cheatsheetListPanel = new JPanel();
+        cheatsheetListPanel.setLayout(new BoxLayout(cheatsheetListPanel, BoxLayout.Y_AXIS));
+        cheatsheetListPanel.setBackground(appBackground);
 
-        for (CheatsheetEntry entry : CheatsheetLibrary.getEntries()) {
-            JPanel card = buildCheatsheetCard(entry);
-            card.setAlignmentX(Component.LEFT_ALIGNMENT);
-            listPanel.add(card);
-            listPanel.add(Box.createVerticalStrut(10));
-        }
+        cheatsheetLoadingLabel = new JLabel("Cheatsheets will load when you open this tab.");
+        cheatsheetLoadingLabel.setFont(bodyFont);
+        cheatsheetLoadingLabel.setForeground(mutedText);
+        cheatsheetLoadingLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cheatsheetListPanel.add(cheatsheetLoadingLabel);
 
-        JScrollPane scrollPane = new JScrollPane(listPanel);
-        scrollPane.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
-        scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        cheatsheetScrollPane = new JScrollPane(cheatsheetListPanel);
+        cheatsheetScrollPane.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        cheatsheetScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        cheatsheetScrollPane.getVerticalScrollBar().setUnitIncrement(16);
 
-        panel.add(scrollPane, BorderLayout.CENTER);
+        panel.add(cheatsheetScrollPane, BorderLayout.CENTER);
         return panel;
+    }
+
+    private void loadCheatsheetIfNeeded() {
+        if (cheatsheetLoaded || cheatsheetListPanel == null) {
+            return;
+        }
+        cheatsheetLoaded = true;
+        if (cheatsheetLoadingLabel != null) {
+            cheatsheetLoadingLabel.setText("Loading cheatsheets...");
+        }
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            List<CheatsheetEntry> entries = new ArrayList<>(CheatsheetLibrary.getEntries());
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive) {
+                    return;
+                }
+                buildCheatsheetBatch(entries, 0);
+            });
+        });
+    }
+
+    private void buildCheatsheetBatch(List<CheatsheetEntry> entries, int startIndex) {
+        SwingUtilities.invokeLater(() -> {
+            if (cheatsheetListPanel == null) {
+                return;
+            }
+            if (cheatsheetLoadingLabel != null) {
+                cheatsheetListPanel.remove(cheatsheetLoadingLabel);
+                cheatsheetLoadingLabel = null;
+            }
+            int end = Math.min(startIndex + 6, entries.size());
+            for (int i = startIndex; i < end; i++) {
+                JPanel card = buildCheatsheetCard(entries.get(i));
+                card.setAlignmentX(Component.LEFT_ALIGNMENT);
+                cheatsheetListPanel.add(card);
+                cheatsheetListPanel.add(Box.createVerticalStrut(10));
+            }
+            cheatsheetListPanel.revalidate();
+            cheatsheetListPanel.repaint();
+            if (end < entries.size()) {
+                buildCheatsheetBatch(entries, end);
+            }
+        });
     }
 
     private JPanel buildCheatsheetCard(CheatsheetEntry entry) {
@@ -2058,9 +2145,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         ));
         content.add(Box.createVerticalStrut(12));
         content.add(createOptionsSectionPanel(
-            "Hotkeys",
-            "Keyboard shortcuts.",
-            buildHotkeysContent()
+            "Search",
+            "Search notes across targets and jump to matching lines.",
+            buildSearchOptionsContent()
         ));
         content.add(Box.createVerticalStrut(12));
         content.add(createOptionsSectionPanel(
@@ -2108,15 +2195,13 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         deleteTargetButton.setFont(bodyFont);
         deleteTargetButton.addActionListener(event -> deleteSelectedTargetFromUi());
 
-        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        row.setBackground(surfaceBackground);
-        JLabel targetLabel = new JLabel("Target:");
-        targetLabel.setFont(bodyFont);
+        JPanel targetActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        targetActions.setBackground(surfaceBackground);
+        targetActions.add(refreshTargetsButton);
+        targetActions.add(deleteTargetButton);
 
-        row.add(targetLabel);
-        row.add(targetCombo);
-        row.add(refreshTargetsButton);
-        row.add(deleteTargetButton);
+        JPanel row = createLabeledRowWithActions("Target:", targetCombo, targetActions);
+        alignLeft(row);
 
         content.add(row);
         content.add(Box.createVerticalStrut(6));
@@ -2124,6 +2209,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         JLabel hint = new JLabel("Only base domains are shown. Subdomains are excluded.");
         hint.setFont(bodyFont);
         hint.setForeground(mutedText);
+        alignLeft(hint);
         content.add(hint);
 
         addTargetField = new JTextField(22);
@@ -2136,11 +2222,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         addTargetButton.setFont(bodyFont);
         addTargetButton.addActionListener(event -> addManualTarget());
 
-        JPanel addRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        addRow.setBackground(surfaceBackground);
-        addRow.add(new JLabel("Add:"));
-        addRow.add(addTargetField);
-        addRow.add(addTargetButton);
+        JPanel addActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        addActions.setBackground(surfaceBackground);
+        addActions.add(addTargetButton);
+
+        JPanel addRow = createLabeledRowWithActions("Add:", addTargetField, addActions);
+        alignLeft(addRow);
 
         content.add(Box.createVerticalStrut(6));
         content.add(addRow);
@@ -2193,16 +2280,21 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
         JScrollPane filterScroll = new JScrollPane(tagFilterList);
         filterScroll.setBorder(BorderFactory.createLineBorder(borderColor));
+        alignLeft(filterScroll);
 
         JPanel filterPanel = new JPanel();
         filterPanel.setLayout(new BoxLayout(filterPanel, BoxLayout.Y_AXIS));
         filterPanel.setBackground(surfaceBackground);
+        alignLeft(tagFilterEnabledCheck, tagFilterMatchAllCheck, filterPanel);
+        tagFilterEnabledCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        tagFilterMatchAllCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
         filterPanel.add(tagFilterEnabledCheck);
         filterPanel.add(tagFilterMatchAllCheck);
         filterPanel.add(Box.createVerticalStrut(6));
         JLabel filterLabel = new JLabel("Filter tags:");
         filterLabel.setFont(bodyFont);
         filterLabel.setForeground(mutedText);
+        alignLeft(filterLabel);
         filterPanel.add(filterLabel);
         filterPanel.add(Box.createVerticalStrut(4));
         filterPanel.add(filterScroll);
@@ -2233,10 +2325,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         exportActions.setBackground(surfaceBackground);
         exportActions.add(exportUseFilterCheck);
         exportActions.add(exportButton);
+        alignLeft(exportActions);
 
         JPanel exportPanel = new JPanel();
         exportPanel.setLayout(new BoxLayout(exportPanel, BoxLayout.Y_AXIS));
         exportPanel.setBackground(surfaceBackground);
+        alignLeft(exportRow, exportActions, exportPanel);
         exportPanel.add(exportRow);
         exportPanel.add(Box.createVerticalStrut(6));
         exportPanel.add(exportActions);
@@ -2257,14 +2351,17 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
         JScrollPane analyticsScroll = new JScrollPane(tagAnalyticsArea);
         analyticsScroll.setBorder(BorderFactory.createLineBorder(borderColor));
+        alignLeft(analyticsScroll);
 
         refreshAnalyticsButton = new JButton("Refresh Analytics");
         refreshAnalyticsButton.setFont(bodyFont);
         refreshAnalyticsButton.addActionListener(event -> tagAnalyticsArea.setText(buildTagAnalyticsReport()));
+        refreshAnalyticsButton.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JPanel analyticsPanel = new JPanel();
         analyticsPanel.setLayout(new BoxLayout(analyticsPanel, BoxLayout.Y_AXIS));
         analyticsPanel.setBackground(surfaceBackground);
+        alignLeft(analyticsPanel);
         analyticsPanel.add(analyticsScroll);
         analyticsPanel.add(Box.createVerticalStrut(6));
         analyticsPanel.add(refreshAnalyticsButton);
@@ -2284,43 +2381,16 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return content;
     }
 
-    private JPanel buildHotkeysContent() {
-        JPanel content = new JPanel();
-        content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
-        content.setBackground(surfaceBackground);
-
-        JPanel keyRow = createHotkeyRow("Ctrl+F", "Search notes (shows line numbers)");
-
-        JButton openSearchButton = new JButton("Open Search");
-        openSearchButton.setFont(bodyFont);
-        openSearchButton.addActionListener(event -> showSearchDialog());
-
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        actions.setBackground(surfaceBackground);
-        actions.add(openSearchButton);
-
-        content.add(keyRow);
-        content.add(Box.createVerticalStrut(6));
-        content.add(actions);
-
-        return content;
-    }
-
     private JPanel buildSearchOptionsContent() {
         JPanel content = new JPanel();
         content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
         content.setBackground(surfaceBackground);
 
-        JLabel hint = new JLabel("Search notes and jump to the matching line.");
-        hint.setFont(bodyFont);
-        hint.setForeground(mutedText);
-
         JButton openSearchButton = new JButton("Open Search");
         openSearchButton.setFont(bodyFont);
         openSearchButton.addActionListener(event -> showSearchDialog());
-
-        content.add(hint);
-        content.add(Box.createVerticalStrut(6));
+        openSearchButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        content.add(Box.createVerticalStrut(2));
         content.add(openSearchButton);
 
         return content;
@@ -2336,6 +2406,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         autoSaveCheck.setBackground(surfaceBackground);
         autoSaveCheck.addItemListener(event -> updateCurrentStateFromUi());
         autoSaveCheck.setEnabled(false);
+        autoSaveCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         storageDirectoryField = new JTextField(26);
         storageDirectoryField.setFont(bodyFont);
@@ -2345,9 +2416,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         JPanel storagePanel = new JPanel();
         storagePanel.setLayout(new BoxLayout(storagePanel, BoxLayout.Y_AXIS));
         storagePanel.setBackground(surfaceBackground);
+        alignLeft(storagePanel);
         storagePanel.add(autoSaveCheck);
         storagePanel.add(Box.createVerticalStrut(6));
-        storagePanel.add(createLabeledRow("Storage directory:", storageDirectoryField));
+        JPanel storageRow = createLabeledRow("Storage directory:", storageDirectoryField);
+        alignLeft(storageRow);
+        storagePanel.add(storageRow);
 
         JPanel storageCard = createOptionsSubsection(
             "Storage",
@@ -2374,6 +2448,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         importPathWithBrowse.setBackground(surfaceBackground);
         importPathWithBrowse.add(importPathRow, BorderLayout.CENTER);
         importPathWithBrowse.add(importBrowseButton, BorderLayout.EAST);
+        alignLeft(importPathWithBrowse);
 
         importModeCombo = new JComboBox<>(new String[] {
             "Import into current target",
@@ -2394,10 +2469,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         importActions.add(importModeCombo);
         importActions.add(importReplaceCheck);
         importActions.add(importButton);
+        alignLeft(importActions);
 
         JPanel importPanel = new JPanel();
         importPanel.setLayout(new BoxLayout(importPanel, BoxLayout.Y_AXIS));
         importPanel.setBackground(surfaceBackground);
+        alignLeft(importPanel, importPathWithBrowse, importActions);
         importPanel.add(importPathWithBrowse);
         importPanel.add(Box.createVerticalStrut(6));
         importPanel.add(importActions);
@@ -2414,6 +2491,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         exportSelectedPathField.getDocument().addDocumentListener(new SimpleDocumentListener(this::updateExportPathFromUi));
 
         JPanel exportSelectedRow = createLabeledRow("Export path:", exportSelectedPathField);
+        alignLeft(exportSelectedRow);
 
         exportTargetsListModel = new DefaultListModel<>();
         exportTargetsList = new JList<>(exportTargetsListModel);
@@ -2424,6 +2502,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
         JScrollPane exportTargetsScroll = new JScrollPane(exportTargetsList);
         exportTargetsScroll.setBorder(BorderFactory.createLineBorder(borderColor));
+        alignLeft(exportTargetsScroll);
 
         refreshExportTargetsButton = new JButton("Refresh Targets");
         refreshExportTargetsButton.setFont(bodyFont);
@@ -2441,10 +2520,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         exportSelectedActions.add(exportFormatCombo);
         exportSelectedActions.add(refreshExportTargetsButton);
         exportSelectedActions.add(exportSelectedButton);
+        alignLeft(exportSelectedActions);
 
         JPanel exportPanel = new JPanel();
         exportPanel.setLayout(new BoxLayout(exportPanel, BoxLayout.Y_AXIS));
         exportPanel.setBackground(surfaceBackground);
+        alignLeft(exportPanel);
         exportPanel.add(exportSelectedRow);
         exportPanel.add(Box.createVerticalStrut(6));
         exportPanel.add(exportTargetsScroll);
@@ -2474,6 +2555,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         JPanel interfacePanel = new JPanel();
         interfacePanel.setLayout(new BoxLayout(interfacePanel, BoxLayout.Y_AXIS));
         interfacePanel.setBackground(surfaceBackground);
+        alignLeft(interfacePanel, showOutlineCheck);
         interfacePanel.add(showOutlineCheck);
         interfacePanel.add(Box.createVerticalStrut(4));
         interfacePanel.add(outlineHint);
@@ -2487,6 +2569,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         memoryUsageLabel = new JLabel("Extension memory (approx): --");
         memoryUsageLabel.setFont(bodyFont);
         memoryUsageLabel.setForeground(mutedText);
+        memoryUsageLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         unloadInactiveTargetsCheck = new JCheckBox("Unload inactive targets to reduce RAM");
         unloadInactiveTargetsCheck.setFont(bodyFont);
@@ -2504,6 +2587,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         JPanel performancePanel = new JPanel();
         performancePanel.setLayout(new BoxLayout(performancePanel, BoxLayout.Y_AXIS));
         performancePanel.setBackground(surfaceBackground);
+        alignLeft(performancePanel);
         performancePanel.add(memoryUsageLabel);
         performancePanel.add(Box.createVerticalStrut(6));
         performancePanel.add(unloadInactiveTargetsCheck);
@@ -2556,10 +2640,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         dataActions.setBackground(surfaceBackground);
         dataActions.add(deleteTargetDataButton);
         dataActions.add(clearAllDataButton);
+        alignLeft(dataActions);
 
         JPanel dataPanel = new JPanel();
         dataPanel.setLayout(new BoxLayout(dataPanel, BoxLayout.Y_AXIS));
         dataPanel.setBackground(surfaceBackground);
+        alignLeft(dataPanel);
         dataPanel.add(dataActions);
 
         JPanel dataCard = createOptionsSubsection(
@@ -2655,25 +2741,23 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return row;
     }
 
-    private JPanel createHotkeyRow(String key, String description) {
-        JPanel row = new JPanel(new BorderLayout(8, 0));
-        row.setBackground(surfaceBackground);
-
-        JLabel keyLabel = new JLabel(key);
-        keyLabel.setFont(monoFont);
-        keyLabel.setForeground(accentColor);
-        keyLabel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(borderColor),
-            BorderFactory.createEmptyBorder(2, 6, 2, 6)
-        ));
-
-        JLabel descLabel = new JLabel(description);
-        descLabel.setFont(bodyFont);
-        descLabel.setForeground(mutedText);
-
-        row.add(keyLabel, BorderLayout.WEST);
-        row.add(descLabel, BorderLayout.CENTER);
+    private JPanel createLabeledRowWithActions(String labelText, JComponent field, JComponent actions) {
+        JPanel row = createLabeledRow(labelText, field);
+        if (actions != null) {
+            row.add(actions, BorderLayout.EAST);
+        }
         return row;
+    }
+
+    private void alignLeft(JComponent... components) {
+        if (components == null) {
+            return;
+        }
+        for (JComponent component : components) {
+            if (component != null) {
+                component.setAlignmentX(Component.LEFT_ALIGNMENT);
+            }
+        }
     }
 
     private JPanel createSectionPanel(String title, JPanel content) {
@@ -2773,23 +2857,34 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         if (isRefreshingTargets) {
             return;
         }
+        if (!extensionActive) {
+            return;
+        }
         isRefreshingTargets = true;
-        Thread worker = new Thread(() -> {
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
             try {
+                if (!extensionActive) {
+                    return;
+                }
                 initPublicSuffixListIfNeeded();
                 Set<String> targets = collectInScopeTargets();
                 targets = applyTagFilters(targets);
                 Set<String> finalTargets = targets;
-                SwingUtilities.invokeLater(() -> applyTargetsToUi(finalTargets));
+                SwingUtilities.invokeLater(() -> {
+                    if (!extensionActive) {
+                        isRefreshingTargets = false;
+                        return;
+                    }
+                    applyTargetsToUi(finalTargets);
+                });
             } catch (RuntimeException e) {
                 if (callbacks != null) {
                     callbacks.printError("Failed to refresh targets: " + e.getMessage());
                 }
                 SwingUtilities.invokeLater(() -> isRefreshingTargets = false);
             }
-        }, "burp-notes-targets");
-        worker.setDaemon(true);
-        worker.start();
+        });
     }
 
     private void applyTargetsToUi(Set<String> targets) {
@@ -2898,6 +2993,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         TargetState state = targetStates.get(target);
         if (state != null && state.loaded) {
             tags.addAll(state.selectedTags);
+            tags.removeAll(state.notApplicableTags);
             return tags;
         }
         tags.addAll(loadTagsFromDisk(target));
@@ -2923,6 +3019,11 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         for (String tag : splitList(props.getProperty("tags", ""))) {
             tags.add(tag);
         }
+        Set<String> naTags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (String tag : splitList(props.getProperty("naTags", ""))) {
+            naTags.add(tag);
+        }
+        tags.removeAll(naTags);
         return tags;
     }
 
@@ -3130,6 +3231,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             if (tagList != null) {
                 tagList.setEnabled(true);
                 setTagSelection(state.selectedTags);
+                tagList.repaint();
             }
             if (newTagField != null) {
                 newTagField.setEnabled(true);
@@ -3171,13 +3273,37 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             return;
         }
         TargetState state = getOrCreateState(currentTarget);
+        List<String> selected = tagList.getSelectedValuesList();
         state.selectedTags.clear();
-        state.selectedTags.addAll(tagList.getSelectedValuesList());
+        state.selectedTags.addAll(selected);
         refreshChecklistPanel(state);
+        tagList.repaint();
 
         updateAddChecklistButtonState();
         state.dirty = true;
         scheduleAutoSave();
+    }
+
+    private boolean isTagNotApplicable(String tag) {
+        if (tag == null || currentTarget == null) {
+            return false;
+        }
+        TargetState state = targetStates.get(currentTarget);
+        return state != null && state.notApplicableTags.contains(tag);
+    }
+
+    private void applyTagListRenderer() {
+        if (tagList == null) {
+            return;
+        }
+        ListCellRenderer<? super String> current = tagList.getCellRenderer();
+        if (current instanceof TagListCellRenderer) {
+            tagList.repaint();
+            return;
+        }
+        tagListCellRenderer = new TagListCellRenderer(current);
+        tagList.setCellRenderer(tagListCellRenderer);
+        tagList.repaint();
     }
 
     private void updateStorageDirectoryFromUi() {
@@ -3217,6 +3343,89 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
         }
         addTargetField.setText("");
+    }
+
+    private void installTagListPopup() {
+        if (tagList == null) {
+            return;
+        }
+        tagList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                maybeShow(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                maybeShow(e);
+            }
+
+            private void maybeShow(MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    return;
+                }
+                int index = tagList.locationToIndex(e.getPoint());
+                String clickedTag = null;
+                if (index >= 0) {
+                    clickedTag = tagListModel.getElementAt(index);
+                }
+                final String actionTag = clickedTag;
+
+                JPopupMenu menu = new JPopupMenu();
+                JMenuItem markItem = new JMenuItem("Mark as N/A");
+                markItem.addActionListener(event -> setSelectedTagsNotApplicable(true, actionTag));
+                JMenuItem clearItem = new JMenuItem("Clear N/A");
+                clearItem.addActionListener(event -> setSelectedTagsNotApplicable(false, actionTag));
+                menu.add(markItem);
+                menu.add(clearItem);
+
+                menu.show(e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    private void setSelectedTagsNotApplicable(boolean notApplicable, String clickedTag) {
+        if (currentTarget == null || tagList == null) {
+            return;
+        }
+        List<String> selected = tagList.getSelectedValuesList();
+        List<String> targets = new ArrayList<>();
+        if (clickedTag != null && !clickedTag.trim().isEmpty()) {
+            boolean clickedSelected = false;
+            for (String tag : selected) {
+                if (tag.equals(clickedTag)) {
+                    clickedSelected = true;
+                    break;
+                }
+            }
+            if (clickedSelected) {
+                targets.addAll(selected);
+            } else {
+                targets.add(clickedTag);
+            }
+        } else {
+            targets.addAll(selected);
+        }
+        if (targets.isEmpty()) {
+            if (callbacks != null) {
+                callbacks.issueAlert("Select one or more tags first.");
+            }
+            return;
+        }
+        TargetState state = getOrCreateState(currentTarget);
+        if (notApplicable) {
+            state.notApplicableTags.addAll(targets);
+            state.selectedTags.removeAll(targets);
+            setTagSelection(state.selectedTags);
+        } else {
+            state.notApplicableTags.removeAll(targets);
+        }
+        refreshChecklistPanel(state);
+        if (tagListCellRenderer != null) {
+            tagList.repaint();
+        }
+        state.dirty = true;
+        scheduleAutoSave();
     }
 
     private void deleteSelectedTargetFromUi() {
@@ -3300,6 +3509,18 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         saveExecutor = Executors.newSingleThreadExecutor(factory);
     }
 
+    private void ensureBackgroundExecutor() {
+        if (backgroundExecutor != null) {
+            return;
+        }
+        ThreadFactory factory = runnable -> {
+            Thread thread = new Thread(runnable, "burp-notes-bg");
+            thread.setDaemon(true);
+            return thread;
+        };
+        backgroundExecutor = Executors.newSingleThreadExecutor(factory);
+    }
+
     private void shutdownSaveExecutor() {
         if (saveExecutor == null) {
             return;
@@ -3311,6 +3532,21 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
         } catch (InterruptedException e) {
             saveExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void shutdownBackgroundExecutor() {
+        if (backgroundExecutor == null) {
+            return;
+        }
+        backgroundExecutor.shutdown();
+        try {
+            if (!backgroundExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                backgroundExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            backgroundExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
@@ -3357,6 +3593,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         props.setProperty("notes", encodeBase64(snapshot.notesText));
         props.setProperty("autoSave", Boolean.toString(snapshot.autoSave));
         props.setProperty("tags", String.join("|", snapshot.selectedTags));
+        props.setProperty("naTags", String.join("|", snapshot.notApplicableTags));
         props.setProperty("attachments", String.join("|", snapshot.attachments));
         props.setProperty("checklists", serializeChecklistState(snapshot.checklistStates));
         props.setProperty("customChecklistItems", serializeCustomChecklistItems(snapshot.customChecklistItems));
@@ -3384,7 +3621,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         Path notesFile = targetDir.resolve(NOTES_FILE_NAME);
         if (!Files.exists(notesFile)) {
             if (SAMPLE_TARGET.equalsIgnoreCase(target)) {
-                ensureSampleNotes();
+                ensureSampleNotesAsync();
             }
             if (!Files.exists(notesFile)) {
                 state.loaded = true;
@@ -3410,6 +3647,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         for (String tag : splitList(props.getProperty("tags", ""))) {
             state.selectedTags.add(tag);
         }
+
+        state.notApplicableTags.clear();
+        for (String tag : splitList(props.getProperty("naTags", ""))) {
+            state.notApplicableTags.add(tag);
+        }
+        state.selectedTags.removeAll(state.notApplicableTags);
 
         state.attachments.clear();
         state.attachments.addAll(splitList(props.getProperty("attachments", "")));
@@ -3530,6 +3773,20 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
         List<String> selected = attachmentList.getSelectedValuesList();
         if (selected.isEmpty()) {
+            return;
+        }
+
+        String message = selected.size() == 1
+            ? "Delete selected screenshot?"
+            : "Delete " + selected.size() + " selected screenshots?";
+        int confirm = JOptionPane.showConfirmDialog(
+            rootPanel,
+            message,
+            "Delete Screenshot",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE
+        );
+        if (confirm != JOptionPane.YES_OPTION) {
             return;
         }
 
@@ -3862,6 +4119,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         });
 
         customizeRecursive(detachedFrame.getRootPane());
+        applyTagListRenderer();
         detachedFrame.getContentPane().revalidate();
         detachedFrame.getContentPane().repaint();
         detachedFrame.setVisible(true);
@@ -3987,6 +4245,35 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         rebuildTagModel();
     }
 
+    private void loadDefaultTagsAsync() {
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            List<String> defaults = new ArrayList<>(TagLibrary.getAllTagNames());
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive) {
+                    return;
+                }
+                boolean changed = false;
+                for (String tag : defaults) {
+                    if (globalTags.add(tag)) {
+                        changed = true;
+                    }
+                }
+                removeExcludedTags();
+                if (changed || (tagListModel != null && tagListModel.getSize() == 0)) {
+                    rebuildTagModel();
+                }
+                if (currentTarget != null) {
+                    refreshChecklistPanel(getOrCreateState(currentTarget));
+                    updateAddChecklistButtonState();
+                }
+            });
+        });
+    }
+
     private void rebuildTagModel() {
         if (tagListModel == null) {
             return;
@@ -4073,6 +4360,18 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             return;
         }
 
+        if (!TagLibrary.isLoaded()) {
+            JLabel empty = new JLabel("Loading checklists...");
+            empty.setFont(bodyFont);
+            empty.setForeground(mutedText);
+            empty.setAlignmentX(Component.LEFT_ALIGNMENT);
+            tagChecklistContainer.add(empty);
+            tagChecklistContainer.revalidate();
+            tagChecklistContainer.repaint();
+            loadDefaultTagsAsync();
+            return;
+        }
+
         boolean added = false;
         List<String> orderedTags = getSelectedTagsInUiOrder(state.selectedTags);
         Set<String> seenChecklistKeys = new HashSet<>();
@@ -4119,6 +4418,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 () -> showChecklistInfo(tag, entry, finalItems),
                 () -> removeChecklist(key, false, tag),
                 false,
+                state.notApplicableTags.contains(tag),
                 removableItems,
                 item -> removeChecklistItem(key, item)
             );
@@ -4226,6 +4526,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             () -> showChecklistInfo(custom.title, entry, items),
             () -> removeChecklist(custom.id, true, custom.title),
             true,
+            false,
             new HashSet<>(),
             null
         );
@@ -4341,54 +4642,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         if (addChecklistItemField != null) {
             addChecklistItemField.setEnabled(enabled);
         }
-    }
-
-    private void registerSearchHotkey(JComponent component) {
-        if (component == null) {
-            return;
-        }
-        KeyStroke shortcut = KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx());
-        String actionKey = "search-notes";
-        component.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).put(shortcut, actionKey);
-        component.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(shortcut, actionKey);
-        component.getActionMap().put(actionKey, new AbstractAction() {
-            @Override
-            public void actionPerformed(ActionEvent event) {
-                showSearchDialog();
-            }
-        });
-    }
-
-    private void installGlobalSearchDispatcher() {
-        if (searchDispatcherInstalled) {
-            return;
-        }
-        searchDispatcherInstalled = true;
-        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(event -> {
-            if (event.getID() != KeyEvent.KEY_PRESSED) {
-                return false;
-            }
-            if (event.getKeyCode() != KeyEvent.VK_F) {
-                return false;
-            }
-            if (!(event.isControlDown() || event.isMetaDown())) {
-                return false;
-            }
-            Component focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
-            if (focusOwner == null) {
-                return false;
-            }
-            boolean inMain = rootPanel != null && SwingUtilities.isDescendingFrom(focusOwner, rootPanel);
-            boolean inDetached = detachedFrame != null
-                && detachedFrame.getRootPane() != null
-                && SwingUtilities.isDescendingFrom(focusOwner, detachedFrame.getRootPane());
-            if (!inMain && !inDetached) {
-                return false;
-            }
-            showSearchDialog();
-            event.consume();
-            return true;
-        });
     }
 
     private void showSearchDialog() {
@@ -4723,18 +4976,60 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         if (markdownPreview == null) {
             return;
         }
-        String markdown = notesArea != null ? notesArea.getText() : "";
-        try {
-            markdownPreview.setText(renderMarkdownToHtml(markdown));
-            markdownPreview.setCaretPosition(0);
-        } catch (RuntimeException e) {
-            if (callbacks != null) {
-                callbacks.printError("Preview render failed: " + e.getMessage());
-            }
-            markdownPreview.setText(renderPreviewError(markdown));
-            markdownPreview.setCaretPosition(0);
+        if (notesEditorTabs != null && notesEditorTabs.getSelectedIndex() != 1) {
+            previewDirty = true;
+            return;
         }
-        previewDirty = false;
+        scheduleMarkdownPreview();
+    }
+
+    private void scheduleMarkdownPreview() {
+        if (markdownPreview == null) {
+            return;
+        }
+        String markdown = notesArea != null ? notesArea.getText() : "";
+        previewRenderToken++;
+        final int token = previewRenderToken;
+        if (notesEditorTabs != null && notesEditorTabs.getSelectedIndex() == 1) {
+            markdownPreview.setText(renderPreviewLoading());
+        }
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            if (token != previewRenderToken) {
+                return;
+            }
+            String html;
+            try {
+                html = renderMarkdownToHtml(markdown);
+            } catch (RuntimeException e) {
+                if (callbacks != null) {
+                    callbacks.printError("Preview render failed: " + e.getMessage());
+                }
+                html = renderPreviewError(markdown);
+            }
+            final String result = html;
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive) {
+                    return;
+                }
+                if (token != previewRenderToken) {
+                    return;
+                }
+                markdownPreview.setText(result);
+                markdownPreview.setCaretPosition(0);
+                previewDirty = false;
+            });
+        });
+    }
+
+    private String renderPreviewLoading() {
+        String fg = toHex(getUiColor("TextArea.foreground", getUiColor("Label.foreground", new Color(40, 40, 40))));
+        String bg = toHex(surfaceBackground);
+        return "<html><body style='margin:0;padding:8px;background:" + bg + ";color:" + fg
+            + ";font-family:Sans-Serif;'>Rendering preview...</body></html>";
     }
 
     private String renderMarkdownToHtml(String markdown) {
@@ -5479,7 +5774,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         String escaped = escapeHtml(text);
         escaped = escaped.replaceAll("\\*\\*([^*]+)\\*\\*", "<strong>$1</strong>");
         escaped = escaped.replaceAll("\\*([^*]+)\\*\\*", "<em>$1</em>");
-        escaped = escaped.replaceAll("\\[(.+?)\\]\\((.+?)\\)", "<a href='$2'>$1</a>");
+        escaped = replaceMarkdownLinks(escaped);
         return escaped;
     }
 
@@ -5518,9 +5813,13 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 return null;
             }
             String border = toHex(borderColor);
-            String label = escapeHtml(filename);
+            String label = escapeHtmlAttr(filename);
             String labelColor = toHex(mutedText);
-            String fileUrl = file.toUri().toString();
+        String fileUrl = file.toUri().toString();
+        if (sanitizeUrl(fileUrl) == null) {
+            return null;
+        }
+        fileUrl = escapeHtmlAttr(fileUrl);
             if (block) {
                 return "<div style='margin:8px 0;'>" +
                     "<img src='" + fileUrl + "' alt='" + label + "' style='max-width:100%; max-height:" + PREVIEW_IMAGE_MAX_HEIGHT + "px; border:1px solid " + border + "; border-radius:6px;'>" +
@@ -5573,9 +5872,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         notesArea = state.notesArea;
         notesUndoManager = state.notesUndoManager;
         markdownPreview = state.markdownPreview;
-        notesEditorTabs = state.notesEditorTabs;
-        notesLineNumbers = state.notesLineNumbers;
-        notesTargetLabel = state.notesTargetLabel;
+            notesEditorTabs = state.notesEditorTabs;
+            notesLineNumbers = state.notesLineNumbers;
+            notesTargetLabel = state.notesTargetLabel;
         tagListModel = state.tagListModel;
         tagList = state.tagList;
         newTagField = state.newTagField;
@@ -5593,13 +5892,14 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         notesEditorSplit = state.notesEditorSplit;
         outlinePanel = state.outlinePanel;
         outlinePlaceholder = state.outlinePlaceholder;
-        outlineListModel = state.outlineListModel;
-        outlineList = state.outlineList;
-        if (detachNotesButton != null) {
-            detachNotesButton.setText(detachedFrame == null ? "Detach" : "Attach");
+            outlineListModel = state.outlineListModel;
+            outlineList = state.outlineList;
+            if (detachNotesButton != null) {
+                detachNotesButton.setText(detachedFrame == null ? "Detach" : "Attach");
+            }
+            updateOutlineVisibility();
+            applyTagListRenderer();
         }
-        updateOutlineVisibility();
-    }
 
     private BufferedImage scaleImage(BufferedImage source, int maxWidth, int maxHeight) {
         int width = source.getWidth();
@@ -5735,7 +6035,65 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             "</body></html>";
     }
 
+    private String replaceMarkdownLinks(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        StringBuffer sb = new StringBuffer();
+        Pattern pattern = Pattern.compile("\\[(.+?)\\]\\((.+?)\\)");
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            String label = matcher.group(1);
+            String url = matcher.group(2);
+            String safe = sanitizeUrl(url);
+            if (safe == null) {
+                matcher.appendReplacement(sb, Matcher.quoteReplacement(label + " (" + url + ")"));
+            } else {
+                String replacement = "<a href='" + escapeHtmlAttr(safe) + "'>" + escapeHtml(label) + "</a>";
+                matcher.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+            }
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
+    }
+
+    private String sanitizeUrl(String url) {
+        if (url == null) {
+            return null;
+        }
+        String trimmed = url.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.startsWith("#")) {
+            return "#";
+        }
+        int colon = trimmed.indexOf(':');
+        if (colon <= 0) {
+            return null;
+        }
+        String scheme = trimmed.substring(0, colon).toLowerCase(Locale.ROOT);
+        if (!("http".equals(scheme) || "https".equals(scheme) || "mailto".equals(scheme) || "file".equals(scheme))) {
+            return null;
+        }
+        return trimmed;
+    }
+
+    private String escapeHtmlAttr(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;");
+    }
+
     private String escapeHtml(String text) {
+        if (text == null) {
+            return "";
+        }
         return text.replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;");
@@ -7136,24 +7494,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return set;
     }
 
-    private static final class LanguageProfile {
-        private final Set<String> keywords;
-        private final List<String> lineComments;
-        private final String blockStart;
-        private final String blockEnd;
-        private final boolean backtickStrings;
-        private final boolean caseInsensitive;
-
-        private LanguageProfile(Set<String> keywords, List<String> lineComments, String blockStart, String blockEnd, boolean backtickStrings, boolean caseInsensitive) {
-            this.keywords = keywords == null ? new HashSet<>() : keywords;
-            this.lineComments = lineComments == null ? new ArrayList<>() : lineComments;
-            this.blockStart = blockStart;
-            this.blockEnd = blockEnd;
-            this.backtickStrings = backtickStrings;
-            this.caseInsensitive = caseInsensitive;
-        }
-    }
-
     private final class TagChecklistCard extends JPanel {
         private final JPanel body;
         private boolean collapsed;
@@ -7162,10 +7502,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         private final Runnable onInfo;
         private final Runnable onRemove;
         private final boolean isCustomCard;
+        private final boolean tagNotApplicable;
         private final Consumer<String> onRemoveItem;
         private final Set<String> removableItems;
         private boolean updating;
         private final String tagTitle;
+        private final Map<String, ChecklistItemState> baseItemStates = new HashMap<>();
 
         private TagChecklistCard(String tag,
                                  List<String> items,
@@ -7174,6 +7516,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                                  Runnable onInfo,
                                  Runnable onRemove,
                                  boolean isCustomCard,
+                                 boolean tagNotApplicable,
                                  Set<String> removableItems,
                                  Consumer<String> onRemoveItem) {
             super(new BorderLayout());
@@ -7181,6 +7524,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             this.onInfo = onInfo;
             this.onRemove = onRemove;
             this.isCustomCard = isCustomCard;
+            this.tagNotApplicable = tagNotApplicable;
             this.onRemoveItem = onRemoveItem;
             this.removableItems = removableItems == null ? new HashSet<>() : removableItems;
             this.tagTitle = tag == null ? "" : tag;
@@ -7240,7 +7584,16 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                     box.putClientProperty("itemText", item);
                     box.putClientProperty("normalColor", box.getForeground());
                     ChecklistItemState itemState = findItemState(state, item);
+                    if (itemState != null) {
+                        ChecklistItemState copy = new ChecklistItemState(itemState.checked, itemState.notApplicable);
+                        baseItemStates.put(item, copy);
+                    } else {
+                        baseItemStates.put(item, new ChecklistItemState());
+                    }
                     applyItemState(box, item, itemState);
+                    if (tagNotApplicable) {
+                        box.setEnabled(false);
+                    }
                     box.addItemListener(event -> {
                         if (updating) {
                             return;
@@ -7255,7 +7608,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                     });
                     body.add(box);
                     checkboxes.put(item, box);
-                    attachChecklistItemPopup(box, item, isRemovableItem(item));
+                    if (!tagNotApplicable) {
+                        attachChecklistItemPopup(box, item, isRemovableItem(item));
+                    }
                 }
             }
 
@@ -7263,7 +7618,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             add(header, BorderLayout.NORTH);
             add(body, BorderLayout.CENTER);
 
-            installChecklistPopup(this);
+            if (!tagNotApplicable) {
+                installChecklistPopup(this);
+            }
         }
 
         private boolean isCollapsed() {
@@ -7296,7 +7653,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
 
         private void applyItemState(JCheckBox box, String item, ChecklistItemState state) {
-            boolean isNa = state != null && state.notApplicable;
+            boolean isNa = tagNotApplicable || (state != null && state.notApplicable);
             boolean checked = state != null && state.checked && !isNa;
             updating = true;
             box.setSelected(checked);
@@ -7332,6 +7689,19 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
 
         private Map<String, ChecklistItemState> getItemStates() {
+            if (tagNotApplicable) {
+                Map<String, ChecklistItemState> snapshot = new HashMap<>();
+                for (Map.Entry<String, ChecklistItemState> entry : baseItemStates.entrySet()) {
+                    ChecklistItemState original = entry.getValue();
+                    ChecklistItemState copy = new ChecklistItemState();
+                    if (original != null) {
+                        copy.checked = original.checked;
+                        copy.notApplicable = original.notApplicable;
+                    }
+                    snapshot.put(entry.getKey(), copy);
+                }
+                return snapshot;
+            }
             Map<String, ChecklistItemState> states = new HashMap<>();
             for (Map.Entry<String, JCheckBox> entry : checkboxes.entrySet()) {
                 JCheckBox box = entry.getValue();
@@ -7471,436 +7841,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return targetStates.computeIfAbsent(target, key -> new TargetState());
     }
 
-    private static final class TargetState {
-        private String notesText = "";
-        private boolean autoSave;
-        private final Set<String> selectedTags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-        private final List<String> attachments = new ArrayList<>();
-        private final Map<String, String> attachmentHashes = new HashMap<>();
-        private final Map<String, TagChecklistState> checklistStates = new HashMap<>();
-        private final Map<String, List<String>> customChecklistItems = new LinkedHashMap<>();
-        private final Map<String, CustomChecklist> customChecklists = new LinkedHashMap<>();
-        private boolean loaded;
-        private boolean dirty;
-    }
-
-    private static final class ChecklistItemState {
-        private boolean checked;
-        private boolean notApplicable;
-
-        private ChecklistItemState() {
-        }
-
-        private ChecklistItemState(boolean checked, boolean notApplicable) {
-            this.checked = checked;
-            this.notApplicable = notApplicable;
-        }
-    }
-
-    private static final class TagChecklistState {
-        private final Map<String, ChecklistItemState> itemStates = new HashMap<>();
-        private boolean collapsed;
-    }
-
-    private static final class TargetStateSnapshot {
-        private final String target;
-        private final String notesText;
-        private final boolean autoSave;
-        private final Set<String> selectedTags;
-        private final List<String> attachments;
-        private final Map<String, TagChecklistState> checklistStates;
-        private final Map<String, List<String>> customChecklistItems;
-        private final Map<String, CustomChecklist> customChecklists;
-
-        private TargetStateSnapshot(String target,
-                                    String notesText,
-                                    boolean autoSave,
-                                    Set<String> selectedTags,
-                                    List<String> attachments,
-                                    Map<String, TagChecklistState> checklistStates,
-                                    Map<String, List<String>> customChecklistItems,
-                                    Map<String, CustomChecklist> customChecklists) {
-            this.target = target;
-            this.notesText = notesText;
-            this.autoSave = autoSave;
-            this.selectedTags = selectedTags;
-            this.attachments = attachments;
-            this.checklistStates = checklistStates;
-            this.customChecklistItems = customChecklistItems;
-            this.customChecklists = customChecklists;
-        }
-
-        private static TargetStateSnapshot from(String target, TargetState state) {
-            Set<String> tags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-            tags.addAll(state.selectedTags);
-
-            List<String> attachments = new ArrayList<>(state.attachments);
-
-            Map<String, TagChecklistState> checklistStates = new HashMap<>();
-            for (Map.Entry<String, TagChecklistState> entry : state.checklistStates.entrySet()) {
-                TagChecklistState original = entry.getValue();
-                if (original == null) {
-                    continue;
-                }
-                TagChecklistState copy = new TagChecklistState();
-                copy.collapsed = original.collapsed;
-                for (Map.Entry<String, ChecklistItemState> itemEntry : original.itemStates.entrySet()) {
-                    ChecklistItemState originalItem = itemEntry.getValue();
-                    ChecklistItemState itemCopy = new ChecklistItemState();
-                    if (originalItem != null) {
-                        itemCopy.checked = originalItem.checked;
-                        itemCopy.notApplicable = originalItem.notApplicable;
-                    }
-                    copy.itemStates.put(itemEntry.getKey(), itemCopy);
-                }
-                checklistStates.put(entry.getKey(), copy);
-            }
-
-            Map<String, List<String>> customChecklistItems = new LinkedHashMap<>();
-            for (Map.Entry<String, List<String>> entry : state.customChecklistItems.entrySet()) {
-                if (entry.getKey() == null || entry.getValue() == null) {
-                    continue;
-                }
-                customChecklistItems.put(entry.getKey(), new ArrayList<>(entry.getValue()));
-            }
-
-            Map<String, CustomChecklist> customChecklists = new LinkedHashMap<>();
-            for (Map.Entry<String, CustomChecklist> entry : state.customChecklists.entrySet()) {
-                CustomChecklist checklist = entry.getValue();
-                if (checklist == null) {
-                    continue;
-                }
-                CustomChecklist copy = new CustomChecklist(checklist.id, checklist.title, checklist.afterKey, checklist.items);
-                customChecklists.put(entry.getKey(), copy);
-            }
-
-            return new TargetStateSnapshot(target,
-                state.notesText,
-                state.autoSave,
-                tags,
-                attachments,
-                checklistStates,
-                customChecklistItems,
-                customChecklists
-            );
-        }
-    }
-
-    private static final class CustomChecklist {
-        private final String id;
-        private final String title;
-        private final String afterKey;
-        private final List<String> items;
-
-        private CustomChecklist(String id, String title, String afterKey, List<String> items) {
-            this.id = id;
-            this.title = title;
-            this.afterKey = afterKey == null ? "" : afterKey;
-            this.items = items == null ? new ArrayList<>() : new ArrayList<>(items);
-        }
-    }
-
-    private static final class TargetExport {
-        private final String target;
-        private final String notes;
-
-        private TargetExport(String target, String notes) {
-            this.target = target;
-            this.notes = notes;
-        }
-    }
-
-    private static final class TableRender {
-        private final String html;
-        private final int nextIndex;
-
-        private TableRender(String html, int nextIndex) {
-            this.html = html == null ? "" : html;
-            this.nextIndex = nextIndex;
-        }
-    }
-
-    private static final class ImportedTarget {
-        private final String target;
-        private String notes;
-
-        private ImportedTarget(String target, String notes) {
-            this.target = target;
-            this.notes = notes == null ? "" : notes;
-        }
-    }
-
-    private static final class SimpleJsonParser {
-        private final String input;
-        private int index;
-
-        private SimpleJsonParser(String input) {
-            this.input = input == null ? "" : input;
-        }
-
-        private Object parse() {
-            skipWhitespace();
-            Object value = parseValue();
-            skipWhitespace();
-            if (index < input.length()) {
-                throw new IllegalArgumentException("Unexpected trailing data at position " + index);
-            }
-            return value;
-        }
-
-        private Object parseValue() {
-            skipWhitespace();
-            if (index >= input.length()) {
-                throw new IllegalArgumentException("Unexpected end of JSON");
-            }
-            char c = input.charAt(index);
-            if (c == '{') {
-                return parseObject();
-            }
-            if (c == '[') {
-                return parseArray();
-            }
-            if (c == '\"') {
-                return parseString();
-            }
-            if (c == 't') {
-                consumeLiteral("true");
-                return Boolean.TRUE;
-            }
-            if (c == 'f') {
-                consumeLiteral("false");
-                return Boolean.FALSE;
-            }
-            if (c == 'n') {
-                consumeLiteral("null");
-                return null;
-            }
-            if (c == '-' || Character.isDigit(c)) {
-                return parseNumber();
-            }
-            throw new IllegalArgumentException("Unexpected character '" + c + "' at position " + index);
-        }
-
-        private Map<String, Object> parseObject() {
-            Map<String, Object> map = new LinkedHashMap<>();
-            expect('{');
-            skipWhitespace();
-            if (peek('}')) {
-                index++;
-                return map;
-            }
-            while (true) {
-                skipWhitespace();
-                String key = parseString();
-                skipWhitespace();
-                expect(':');
-                Object value = parseValue();
-                map.put(key, value);
-                skipWhitespace();
-                if (peek('}')) {
-                    index++;
-                    break;
-                }
-                expect(',');
-            }
-            return map;
-        }
-
-        private List<Object> parseArray() {
-            List<Object> list = new ArrayList<>();
-            expect('[');
-            skipWhitespace();
-            if (peek(']')) {
-                index++;
-                return list;
-            }
-            while (true) {
-                Object value = parseValue();
-                list.add(value);
-                skipWhitespace();
-                if (peek(']')) {
-                    index++;
-                    break;
-                }
-                expect(',');
-            }
-            return list;
-        }
-
-        private String parseString() {
-            expect('\"');
-            StringBuilder sb = new StringBuilder();
-            while (index < input.length()) {
-                char c = input.charAt(index++);
-                if (c == '\"') {
-                    break;
-                }
-                if (c == '\\') {
-                    if (index >= input.length()) {
-                        throw new IllegalArgumentException("Invalid escape at end of string");
-                    }
-                    char esc = input.charAt(index++);
-                    switch (esc) {
-                        case '\"':
-                            sb.append('\"');
-                            break;
-                        case '\\':
-                            sb.append('\\');
-                            break;
-                        case '/':
-                            sb.append('/');
-                            break;
-                        case 'b':
-                            sb.append('\b');
-                            break;
-                        case 'f':
-                            sb.append('\f');
-                            break;
-                        case 'n':
-                            sb.append('\n');
-                            break;
-                        case 'r':
-                            sb.append('\r');
-                            break;
-                        case 't':
-                            sb.append('\t');
-                            break;
-                        case 'u':
-                            sb.append(parseUnicode());
-                            break;
-                        default:
-                            throw new IllegalArgumentException("Invalid escape \\" + esc + " at position " + index);
-                    }
-                } else {
-                    sb.append(c);
-                }
-            }
-            return sb.toString();
-        }
-
-        private char parseUnicode() {
-            if (index + 4 > input.length()) {
-                throw new IllegalArgumentException("Invalid unicode escape");
-            }
-            int code = 0;
-            for (int i = 0; i < 4; i++) {
-                char c = input.charAt(index++);
-                int value;
-                if (c >= '0' && c <= '9') {
-                    value = c - '0';
-                } else if (c >= 'a' && c <= 'f') {
-                    value = 10 + (c - 'a');
-                } else if (c >= 'A' && c <= 'F') {
-                    value = 10 + (c - 'A');
-                } else {
-                    throw new IllegalArgumentException("Invalid unicode escape at position " + index);
-                }
-                code = (code << 4) + value;
-            }
-            return (char) code;
-        }
-
-        private Number parseNumber() {
-            int start = index;
-            if (peek('-')) {
-                index++;
-            }
-            while (index < input.length() && Character.isDigit(input.charAt(index))) {
-                index++;
-            }
-            if (peek('.')) {
-                index++;
-                while (index < input.length() && Character.isDigit(input.charAt(index))) {
-                    index++;
-                }
-            }
-            if (peek('e') || peek('E')) {
-                index++;
-                if (peek('+') || peek('-')) {
-                    index++;
-                }
-                while (index < input.length() && Character.isDigit(input.charAt(index))) {
-                    index++;
-                }
-            }
-            String raw = input.substring(start, index);
-            try {
-                if (raw.contains(".") || raw.contains("e") || raw.contains("E")) {
-                    return Double.parseDouble(raw);
-                }
-                return Long.parseLong(raw);
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("Invalid number at position " + start);
-            }
-        }
-
-        private void skipWhitespace() {
-            while (index < input.length() && Character.isWhitespace(input.charAt(index))) {
-                index++;
-            }
-        }
-
-        private void consumeLiteral(String literal) {
-            if (input.startsWith(literal, index)) {
-                index += literal.length();
-                return;
-            }
-            throw new IllegalArgumentException("Expected " + literal + " at position " + index);
-        }
-
-        private void expect(char expected) {
-            if (index >= input.length() || input.charAt(index) != expected) {
-                throw new IllegalArgumentException("Expected '" + expected + "' at position " + index);
-            }
-            index++;
-        }
-
-        private boolean peek(char c) {
-            return index < input.length() && input.charAt(index) == c;
-        }
-    }
-
-    private static final class SearchResult {
-        private final String target;
-        private final int lineNumber;
-        private final String lineText;
-
-        private SearchResult(String target, int lineNumber, String lineText) {
-            this.target = target;
-            this.lineNumber = lineNumber;
-            this.lineText = lineText == null ? "" : lineText.trim();
-        }
-
-        @Override
-        public String toString() {
-            String snippet = lineText;
-            if (snippet == null || snippet.isEmpty()) {
-                snippet = "(blank)";
-            }
-            if (snippet.length() > 80) {
-                snippet = snippet.substring(0, 77) + "...";
-            }
-            return target + " : line " + lineNumber + " — " + snippet;
-        }
-    }
-
-    private static final class OutlineEntry {
-        private final int level;
-        private final String title;
-        private final int lineNumber;
-
-        private OutlineEntry(int level, String title, int lineNumber) {
-            this.level = level;
-            this.title = title == null ? "" : title;
-            this.lineNumber = lineNumber;
-        }
-
-        @Override
-        public String toString() {
-            return title;
-        }
-    }
-
     private final class OutlineCellRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(JList<?> list,
@@ -7921,6 +7861,95 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             return component;
         }
+    }
+
+    private final class TagListCellRenderer implements ListCellRenderer<String> {
+        private final ListCellRenderer<? super String> baseRenderer;
+
+        private TagListCellRenderer(ListCellRenderer<? super String> baseRenderer) {
+            this.baseRenderer = baseRenderer;
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends String> list,
+                                                      String value,
+                                                      int index,
+                                                      boolean isSelected,
+                                                      boolean cellHasFocus) {
+            ListCellRenderer<? super String> renderer = baseRenderer != null ? baseRenderer : new DefaultListCellRenderer();
+            Component component = renderer.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            if (component instanceof JLabel && value != null) {
+                JLabel label = (JLabel) component;
+                boolean isNa = isTagNotApplicable(value);
+                if (isNa) {
+                    label.setText("----- " + value);
+                    label.setForeground(mutedText);
+                    if (isSelected) {
+                        label.setBackground(blend(surfaceBackground, borderColor, 0.12f));
+                        label.setOpaque(true);
+                    }
+                } else {
+                    label.setText(value);
+                }
+            }
+            return component;
+        }
+    }
+
+    private final class LockedTagSelectionModel extends DefaultListSelectionModel {
+        @Override
+        public void setSelectionInterval(int index0, int index1) {
+            if (tagListModel == null) {
+                super.setSelectionInterval(index0, index1);
+                return;
+            }
+            List<Integer> allowed = collectSelectableIndices(index0, index1);
+            if (allowed.isEmpty()) {
+                return;
+            }
+            super.clearSelection();
+            for (Integer idx : allowed) {
+                super.addSelectionInterval(idx, idx);
+            }
+        }
+
+        @Override
+        public void addSelectionInterval(int index0, int index1) {
+            if (tagListModel == null) {
+                super.addSelectionInterval(index0, index1);
+                return;
+            }
+            List<Integer> allowed = collectSelectableIndices(index0, index1);
+            if (allowed.isEmpty()) {
+                return;
+            }
+            for (Integer idx : allowed) {
+                super.addSelectionInterval(idx, idx);
+            }
+        }
+
+        @Override
+        public void removeSelectionInterval(int index0, int index1) {
+            if (tagListModel == null) {
+                super.removeSelectionInterval(index0, index1);
+                return;
+            }
+            super.removeSelectionInterval(index0, index1);
+        }
+
+        private List<Integer> collectSelectableIndices(int index0, int index1) {
+            int min = Math.min(index0, index1);
+            int max = Math.max(index0, index1);
+            List<Integer> allowed = new ArrayList<>();
+            for (int i = min; i <= max; i++) {
+                String value = tagListModel.getElementAt(i);
+                if (value != null && !isTagNotApplicable(value)) {
+                    allowed.add(i);
+                }
+            }
+            return allowed;
+        }
+
     }
 
     private final class LineNumberView extends JComponent implements DocumentListener, CaretListener {
@@ -8099,29 +8128,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             this.outlinePlaceholder = outlinePlaceholder;
             this.outlineListModel = outlineListModel;
             this.outlineList = outlineList;
-        }
-    }
-
-    private static final class SimpleDocumentListener implements DocumentListener {
-        private final Runnable onChange;
-
-        private SimpleDocumentListener(Runnable onChange) {
-            this.onChange = onChange;
-        }
-
-        @Override
-        public void insertUpdate(DocumentEvent event) {
-            onChange.run();
-        }
-
-        @Override
-        public void removeUpdate(DocumentEvent event) {
-            onChange.run();
-        }
-
-        @Override
-        public void changedUpdate(DocumentEvent event) {
-            onChange.run();
         }
     }
 
