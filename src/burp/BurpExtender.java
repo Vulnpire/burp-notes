@@ -65,6 +65,8 @@ import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.function.Consumer;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -78,6 +80,7 @@ import javax.swing.DefaultListCellRenderer;
 import javax.swing.DefaultListSelectionModel;
 import javax.swing.AbstractAction;
 import javax.swing.Action;
+import javax.swing.ActionMap;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
@@ -97,6 +100,7 @@ import javax.swing.JTabbedPane;
 import javax.swing.JPopupMenu;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.InputMap;
 import javax.swing.KeyStroke;
 import javax.swing.ListCellRenderer;
 import javax.swing.ListSelectionModel;
@@ -112,11 +116,19 @@ import javax.swing.event.CaretEvent;
 import javax.swing.event.CaretListener;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.event.UndoableEditEvent;
+import javax.swing.event.UndoableEditListener;
 import javax.swing.text.DefaultEditorKit;
 import javax.swing.text.BadLocationException;
+import javax.swing.text.AbstractDocument;
 import javax.swing.text.DefaultCaret;
 import javax.swing.text.JTextComponent;
+import javax.swing.text.Utilities;
+import javax.swing.undo.CannotRedoException;
+import javax.swing.undo.CannotUndoException;
+import javax.swing.undo.CompoundEdit;
 import javax.swing.undo.UndoManager;
+import javax.swing.undo.UndoableEdit;
 
 public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, IExtensionStateListener {
     private static final String EXTENSION_NAME = "Burp Notes";
@@ -124,20 +136,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private static final String NO_TARGET = "<no in-scope targets>";
     private static final String SAMPLE_TARGET = "example.com";
     private static final String SAMPLE_VERSION = "2026-01-29";
-    private static final Set<String> EXCLUDED_TAGS = new HashSet<>(Arrays.asList(
-        "triage",
-        "valid",
-        "validated",
-        "reported",
-        "fixed",
-        "exploiting",
-        "critical",
-        "high",
-        "medium",
-        "low",
-        "severity",
-        "{severity}"
-    ));
     private static final String SAMPLE_NOTES = String.join("\n",
         "# Example Engagement Notes: example.com",
         "",
@@ -558,6 +556,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private JLabel notesTargetLabel;
     private boolean previewDirty;
     private int previewRenderToken;
+    private int targetLoadToken;
 
     private DefaultComboBoxModel<String> targetModel;
     private JComboBox<String> targetCombo;
@@ -583,6 +582,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private DefaultListModel<SearchResult> searchResultsModel;
     private JList<SearchResult> searchResultsList;
     private Timer searchDialogTimer;
+    private int searchToken;
 
     private DefaultListModel<String> attachmentListModel;
     private JList<String> attachmentList;
@@ -607,9 +607,9 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private Font bodyFont;
     private Font monoFont;
 
-    private final Map<String, TargetState> targetStates = new HashMap<>();
+    private final Map<String, TargetState> targetStates = new ConcurrentHashMap<>();
     private final Set<String> globalTags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-    private final Set<String> activeTagFilters = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+    private final Set<String> activeTagFilters = new ConcurrentSkipListSet<>(String.CASE_INSENSITIVE_ORDER);
     private final Set<String> manualTargets = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     private String currentTarget;
     private String preferredTarget;
@@ -625,12 +625,14 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     private JCheckBox tagFilterMatchAllCheck;
     private JTextArea tagAnalyticsArea;
     private JButton refreshAnalyticsButton;
+    private int analyticsToken;
     private JTextField exportPathField;
     private JButton exportButton;
     private JCheckBox exportUseFilterCheck;
     private DefaultListModel<String> exportTargetsListModel;
     private JList<String> exportTargetsList;
     private JButton refreshExportTargetsButton;
+    private int exportTargetsToken;
     private JComboBox<String> exportFormatCombo;
     private JTextField exportSelectedPathField;
     private JButton exportSelectedButton;
@@ -700,13 +702,18 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     @Override
     public void extensionUnloaded() {
         extensionActive = false;
-        SwingUtilities.invokeLater(() -> {
+        Runnable shutdownTask = () -> {
             cancelAutoSave();
             stopMemoryUsageTimer();
             flushAllState();
             shutdownSaveExecutor();
             shutdownBackgroundExecutor();
-        });
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            shutdownTask.run();
+        } else {
+            SwingUtilities.invokeLater(shutdownTask);
+        }
     }
 
     private void initTheme() {
@@ -759,8 +766,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 }
             }
         }
-        removeExcludedTags();
-
         String last = safeTrim(callbacks.loadExtensionSetting(SETTINGS_LAST_TARGET));
         if (!last.isEmpty()) {
             preferredTarget = last;
@@ -785,8 +790,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                 }
             }
         }
-        removeExcludedTags();
-
         String manualSetting = callbacks.loadExtensionSetting(SETTINGS_MANUAL_TARGETS);
         if (manualSetting != null && !manualSetting.trim().isEmpty()) {
             for (String line : manualSetting.split("\\R")) {
@@ -901,23 +904,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             return;
         }
         callbacks.saveExtensionSetting(SETTINGS_UNLOAD_INACTIVE, Boolean.toString(unloadInactiveTargets));
-    }
-
-    private void removeExcludedTags() {
-        if (!globalTags.isEmpty()) {
-            globalTags.removeIf(tag -> isExcludedTag(tag));
-        }
-        if (!activeTagFilters.isEmpty()) {
-            activeTagFilters.removeIf(tag -> isExcludedTag(tag));
-        }
-    }
-
-    private boolean isExcludedTag(String tag) {
-        if (tag == null) {
-            return false;
-        }
-        String cleaned = tag.trim().toLowerCase(Locale.ROOT);
-        return EXCLUDED_TAGS.contains(cleaned);
     }
 
     private String truncateTitle(String text, int max) {
@@ -1496,6 +1482,8 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         notesArea.setEnabled(false);
         installEnhancedCaret(notesArea);
         installUndoRedo(notesArea);
+        installEditorNavigationBindings(notesArea);
+        installEditorSelectionBindings(notesArea);
         notesArea.getDocument().addDocumentListener(new SimpleDocumentListener(() -> {
             updateCurrentStateFromUi();
             previewDirty = true;
@@ -2347,7 +2335,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         tagAnalyticsArea.setLineWrap(true);
         tagAnalyticsArea.setWrapStyleWord(true);
         tagAnalyticsArea.setBackground(surfaceBackground);
-        tagAnalyticsArea.setText(buildTagAnalyticsReport());
+        tagAnalyticsArea.setText("Loading analytics...");
 
         JScrollPane analyticsScroll = new JScrollPane(tagAnalyticsArea);
         analyticsScroll.setBorder(BorderFactory.createLineBorder(borderColor));
@@ -2355,7 +2343,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
 
         refreshAnalyticsButton = new JButton("Refresh Analytics");
         refreshAnalyticsButton.setFont(bodyFont);
-        refreshAnalyticsButton.addActionListener(event -> tagAnalyticsArea.setText(buildTagAnalyticsReport()));
+        refreshAnalyticsButton.addActionListener(event -> refreshAnalyticsAsync());
         refreshAnalyticsButton.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JPanel analyticsPanel = new JPanel();
@@ -2378,6 +2366,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         content.add(Box.createVerticalStrut(10));
         content.add(analyticsCard);
 
+        refreshAnalyticsAsync();
         return content;
     }
 
@@ -2990,11 +2979,13 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         if (target == null) {
             return tags;
         }
-        TargetState state = targetStates.get(target);
-        if (state != null && state.loaded) {
-            tags.addAll(state.selectedTags);
-            tags.removeAll(state.notApplicableTags);
-            return tags;
+        if (SwingUtilities.isEventDispatchThread()) {
+            TargetState state = targetStates.get(target);
+            if (state != null && state.loaded) {
+                tags.addAll(state.selectedTags);
+                tags.removeAll(state.notApplicableTags);
+                return tags;
+            }
         }
         tags.addAll(loadTagsFromDisk(target));
         return tags;
@@ -3157,104 +3148,200 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     }
 
     private void loadCurrentTargetState() {
+        loadCurrentTargetStateAsync();
+    }
+
+    private void loadCurrentTargetStateAsync() {
         isLoadingState = true;
-        try {
-            if (currentTarget == null) {
-                notesTargetLabel.setText("Current target: (none)");
-                notesArea.setText("");
-                notesArea.setEnabled(false);
-                notesEditorTabs.setEnabled(false);
-                markdownPreview.setText(renderMarkdownToHtml(""));
-                previewDirty = false;
-                if (notesLineNumbers != null) {
-                    notesLineNumbers.setEnabled(false);
-                    notesLineNumbers.repaint();
-                }
-                if (outlineList != null) {
-                    outlineListModel.clear();
-                    outlineList.setEnabled(false);
-                }
-                if (tagList != null) {
-                    tagList.clearSelection();
-                    tagList.setEnabled(false);
-                }
-                if (newTagField != null) {
-                    newTagField.setEnabled(false);
-                }
-                if (addTagButton != null) {
-                    addTagButton.setEnabled(false);
-                }
-                clearChecklistPanel();
-                if (addChecklistButton != null) {
-                    addChecklistButton.setEnabled(false);
-                }
+        if (currentTarget == null) {
+            applyNoTargetState();
+            isLoadingState = false;
+            return;
+        }
 
-                if (attachmentList != null) {
-                    attachmentListModel.clear();
-                    attachmentList.setEnabled(false);
-                }
-                if (pasteScreenshotButton != null) {
-                    pasteScreenshotButton.setEnabled(false);
-                }
-                if (removeAttachmentButton != null) {
-                    removeAttachmentButton.setEnabled(false);
-                }
-                if (renameAttachmentButton != null) {
-                    renameAttachmentButton.setEnabled(false);
-                }
+        final String target = currentTarget;
+        final int token = ++targetLoadToken;
+        showTargetLoadingState(target);
 
-                autoSaveCheck.setSelected(false);
-                autoSaveCheck.setEnabled(false);
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
                 return;
             }
+            TargetState snapshot = new TargetState();
+            loadStateFromDisk(target, snapshot);
+            SwingUtilities.invokeLater(() -> applyLoadedTargetState(target, snapshot, token));
+        });
+    }
 
-            TargetState state = getOrCreateState(currentTarget);
-            loadStateFromDisk(currentTarget, state);
-
-            notesTargetLabel.setText("Current target: " + currentTarget);
-            notesArea.setEnabled(true);
-            notesEditorTabs.setEnabled(true);
-            notesArea.setText(state.notesText);
-            resetUndoManager();
-            previewDirty = true;
-            syncMarkdownPreview();
-            if (notesLineNumbers != null) {
-                notesLineNumbers.setEnabled(true);
-                notesLineNumbers.repaint();
-            }
-            if (outlineList != null) {
-                outlineList.setEnabled(true);
-            }
-            updateOutlineFromNotes();
-            updateOutlineVisibility();
-
-            if (tagList != null) {
-                tagList.setEnabled(true);
-                setTagSelection(state.selectedTags);
-                tagList.repaint();
-            }
-            if (newTagField != null) {
-                newTagField.setEnabled(true);
-            }
-            if (addTagButton != null) {
-                addTagButton.setEnabled(true);
-            }
-            refreshChecklistPanel(state);
-            updateAddChecklistButtonState();
-
-            refreshAttachmentList(state);
-            attachmentList.setEnabled(true);
-            pasteScreenshotButton.setEnabled(true);
-            removeAttachmentButton.setEnabled(true);
-            if (renameAttachmentButton != null) {
-                renameAttachmentButton.setEnabled(true);
-            }
-
-            autoSaveCheck.setEnabled(true);
-            autoSaveCheck.setSelected(state.autoSave);
-        } finally {
-            isLoadingState = false;
+    private void showTargetLoadingState(String target) {
+        notesTargetLabel.setText("Current target: " + target + " (loading...)");
+        notesArea.setText("");
+        notesArea.setEnabled(false);
+        notesEditorTabs.setEnabled(false);
+        markdownPreview.setText(renderPreviewLoading());
+        previewDirty = true;
+        if (notesLineNumbers != null) {
+            notesLineNumbers.setEnabled(false);
+            notesLineNumbers.repaint();
         }
+        if (outlineList != null) {
+            outlineListModel.clear();
+            outlineList.setEnabled(false);
+        }
+        if (tagList != null) {
+            tagList.clearSelection();
+            tagList.setEnabled(false);
+        }
+        if (newTagField != null) {
+            newTagField.setEnabled(false);
+        }
+        if (addTagButton != null) {
+            addTagButton.setEnabled(false);
+        }
+        clearChecklistPanel();
+        if (addChecklistButton != null) {
+            addChecklistButton.setEnabled(false);
+        }
+        if (attachmentList != null) {
+            attachmentListModel.clear();
+            attachmentList.setEnabled(false);
+        }
+        if (pasteScreenshotButton != null) {
+            pasteScreenshotButton.setEnabled(false);
+        }
+        if (removeAttachmentButton != null) {
+            removeAttachmentButton.setEnabled(false);
+        }
+        if (renameAttachmentButton != null) {
+            renameAttachmentButton.setEnabled(false);
+        }
+        autoSaveCheck.setSelected(false);
+        autoSaveCheck.setEnabled(false);
+    }
+
+    private void applyNoTargetState() {
+        notesTargetLabel.setText("Current target: (none)");
+        notesArea.setText("");
+        notesArea.setEnabled(false);
+        notesEditorTabs.setEnabled(false);
+        markdownPreview.setText(renderMarkdownToHtml(""));
+        previewDirty = false;
+        if (notesLineNumbers != null) {
+            notesLineNumbers.setEnabled(false);
+            notesLineNumbers.repaint();
+        }
+        if (outlineList != null) {
+            outlineListModel.clear();
+            outlineList.setEnabled(false);
+        }
+        if (tagList != null) {
+            tagList.clearSelection();
+            tagList.setEnabled(false);
+        }
+        if (newTagField != null) {
+            newTagField.setEnabled(false);
+        }
+        if (addTagButton != null) {
+            addTagButton.setEnabled(false);
+        }
+        clearChecklistPanel();
+        if (addChecklistButton != null) {
+            addChecklistButton.setEnabled(false);
+        }
+        if (attachmentList != null) {
+            attachmentListModel.clear();
+            attachmentList.setEnabled(false);
+        }
+        if (pasteScreenshotButton != null) {
+            pasteScreenshotButton.setEnabled(false);
+        }
+        if (removeAttachmentButton != null) {
+            removeAttachmentButton.setEnabled(false);
+        }
+        if (renameAttachmentButton != null) {
+            renameAttachmentButton.setEnabled(false);
+        }
+        autoSaveCheck.setSelected(false);
+        autoSaveCheck.setEnabled(false);
+    }
+
+    private void applyLoadedTargetState(String target, TargetState loaded, int token) {
+        if (!extensionActive) {
+            return;
+        }
+        if (!Objects.equals(currentTarget, target) || token != targetLoadToken) {
+            return;
+        }
+        TargetState state = getOrCreateState(target);
+        copyTargetState(loaded, state);
+
+        notesTargetLabel.setText("Current target: " + currentTarget);
+        notesArea.setEnabled(true);
+        notesEditorTabs.setEnabled(true);
+        notesArea.setText(state.notesText);
+        resetUndoManager();
+        previewDirty = true;
+        syncMarkdownPreview();
+        if (notesLineNumbers != null) {
+            notesLineNumbers.setEnabled(true);
+            notesLineNumbers.repaint();
+        }
+        if (outlineList != null) {
+            outlineList.setEnabled(true);
+        }
+        updateOutlineFromNotes();
+        updateOutlineVisibility();
+
+        if (tagList != null) {
+            tagList.setEnabled(true);
+            setTagSelection(state.selectedTags);
+            tagList.repaint();
+        }
+        if (newTagField != null) {
+            newTagField.setEnabled(true);
+        }
+        if (addTagButton != null) {
+            addTagButton.setEnabled(true);
+        }
+        refreshChecklistPanel(state);
+        updateAddChecklistButtonState();
+
+        refreshAttachmentList(state);
+        attachmentList.setEnabled(true);
+        pasteScreenshotButton.setEnabled(true);
+        removeAttachmentButton.setEnabled(true);
+        if (renameAttachmentButton != null) {
+            renameAttachmentButton.setEnabled(true);
+        }
+
+        autoSaveCheck.setEnabled(true);
+        autoSaveCheck.setSelected(state.autoSave);
+        isLoadingState = false;
+    }
+
+    private void copyTargetState(TargetState source, TargetState dest) {
+        if (source == null || dest == null) {
+            return;
+        }
+        dest.notesText = source.notesText;
+        dest.autoSave = source.autoSave;
+        dest.selectedTags.clear();
+        dest.selectedTags.addAll(source.selectedTags);
+        dest.notApplicableTags.clear();
+        dest.notApplicableTags.addAll(source.notApplicableTags);
+        dest.attachments.clear();
+        dest.attachments.addAll(source.attachments);
+        dest.attachmentHashes.clear();
+        dest.attachmentHashes.putAll(source.attachmentHashes);
+        dest.checklistStates.clear();
+        dest.checklistStates.putAll(source.checklistStates);
+        dest.customChecklistItems.clear();
+        dest.customChecklistItems.putAll(source.customChecklistItems);
+        dest.customChecklists.clear();
+        dest.customChecklists.putAll(source.customChecklists);
+        dest.loaded = true;
+        dest.dirty = false;
     }
 
     private void updateCurrentStateFromUi() {
@@ -3671,6 +3758,12 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         state.dirty = false;
     }
 
+    private TargetState loadTargetStateSnapshot(String target) {
+        TargetState snapshot = new TargetState();
+        loadStateFromDisk(target, snapshot);
+        return snapshot;
+    }
+
     private void flushAllState() {
         saveCurrentTargetState();
         persistCurrentTargetState();
@@ -3714,57 +3807,200 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             return;
         }
+        final String target = currentTarget;
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            AttachmentPasteResult result = processScreenshotPaste(target, image);
+            SwingUtilities.invokeLater(() -> applyScreenshotPasteResult(result));
+        });
+    }
 
-        Path attachmentsDir = getAttachmentsDir(currentTarget);
+    private AttachmentPasteResult processScreenshotPaste(String target, BufferedImage image) {
+        if (target == null || image == null) {
+            return AttachmentPasteResult.error(target, "No target or image available.");
+        }
+        Path attachmentsDir = getAttachmentsDir(target);
         if (attachmentsDir == null) {
-            return;
+            return AttachmentPasteResult.error(target, "Attachments directory unavailable.");
         }
         try {
             Files.createDirectories(attachmentsDir);
         } catch (IOException e) {
-            if (callbacks != null) {
-                callbacks.printError("Failed to create attachments folder: " + e.getMessage());
-            }
-            return;
+            return AttachmentPasteResult.error(target, "Failed to create attachments folder: " + e.getMessage());
         }
 
         String imageHash = computeImageHash(image);
-
-        TargetState state = getOrCreateState(currentTarget);
+        TargetState state = getOrCreateState(target);
+        if (!state.loaded) {
+            loadStateFromDisk(target, state);
+        }
         String existingName = null;
         if (imageHash != null) {
             existingName = findExistingAttachmentByHash(state, attachmentsDir, imageHash);
         }
-
-        String filename;
         if (existingName != null) {
-            filename = existingName;
-        } else {
-            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS").format(new Date());
-            filename = "screenshot_" + timestamp + ".png";
-            Path filePath = attachmentsDir.resolve(filename);
-
-            try {
-                ImageIO.write(image, "png", filePath.toFile());
-            } catch (IOException e) {
-                if (callbacks != null) {
-                    callbacks.printError("Failed to save screenshot: " + e.getMessage());
-                }
-                return;
-            }
-
-            if (imageHash != null) {
-                state.attachmentHashes.put(filename, imageHash);
-            }
+            return AttachmentPasteResult.existing(target, existingName);
         }
 
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS").format(new Date());
+        String filename = "screenshot_" + timestamp + ".png";
+        Path filePath = attachmentsDir.resolve(filename);
+        try {
+            ImageIO.write(image, "png", filePath.toFile());
+        } catch (IOException e) {
+            return AttachmentPasteResult.error(target, "Failed to save screenshot: " + e.getMessage());
+        }
+        if (imageHash != null) {
+            state.attachmentHashes.put(filename, imageHash);
+        }
         if (!state.attachments.contains(filename)) {
             state.attachments.add(filename);
         }
         state.dirty = true;
+        return AttachmentPasteResult.created(target, filename);
+    }
+
+    private void applyScreenshotPasteResult(AttachmentPasteResult result) {
+        if (result == null) {
+            return;
+        }
+        if (result.error != null) {
+            if (callbacks != null) {
+                callbacks.issueAlert(result.error);
+            }
+            return;
+        }
+        if (!Objects.equals(currentTarget, result.target)) {
+            return;
+        }
+        TargetState state = getOrCreateState(result.target);
         refreshAttachmentList(state);
         scheduleAutoSave();
-        insertAttachmentToken(filename);
+        insertAttachmentToken(result.filename);
+    }
+
+    private static final class AttachmentPasteResult {
+        private final String target;
+        private final String filename;
+        private final String error;
+
+        private AttachmentPasteResult(String target, String filename, String error) {
+            this.target = target;
+            this.filename = filename;
+            this.error = error;
+        }
+
+        private static AttachmentPasteResult created(String target, String filename) {
+            return new AttachmentPasteResult(target, filename, null);
+        }
+
+        private static AttachmentPasteResult existing(String target, String filename) {
+            return new AttachmentPasteResult(target, filename, null);
+        }
+
+        private static AttachmentPasteResult error(String target, String message) {
+            return new AttachmentPasteResult(target, null, message);
+        }
+    }
+
+    private static final class CompoundUndoManager extends UndoManager implements UndoableEditListener {
+        private static final int COMPOUND_DELAY_MS = 650;
+        private CompoundEdit compoundEdit;
+        private Timer compoundTimer;
+        private long lastEditTime;
+        private DocumentEvent.EventType lastEditType;
+        private int lastOffset = -1;
+        private int lastLength;
+
+        @Override
+        public synchronized void undoableEditHappened(UndoableEditEvent event) {
+            UndoableEdit edit = event.getEdit();
+            if (edit == null) {
+                return;
+            }
+            DocumentEvent.EventType type = null;
+            int offset = -1;
+            int length = 0;
+            if (edit instanceof AbstractDocument.DefaultDocumentEvent) {
+                AbstractDocument.DefaultDocumentEvent docEvent = (AbstractDocument.DefaultDocumentEvent) edit;
+                type = docEvent.getType();
+                offset = docEvent.getOffset();
+                length = docEvent.getLength();
+            }
+
+            long now = System.currentTimeMillis();
+            boolean startNew = compoundEdit == null;
+            if (!startNew) {
+                if (type != null && lastEditType != null && type != lastEditType) {
+                    startNew = true;
+                }
+                if (!startNew && now - lastEditTime > COMPOUND_DELAY_MS) {
+                    startNew = true;
+                }
+                if (!startNew && type != null) {
+                    if (type == DocumentEvent.EventType.INSERT) {
+                        if (offset != lastOffset + lastLength) {
+                            startNew = true;
+                        }
+                    } else if (type == DocumentEvent.EventType.REMOVE) {
+                        if (!(offset == lastOffset || offset + length == lastOffset)) {
+                            startNew = true;
+                        }
+                    }
+                }
+            }
+
+            if (startNew) {
+                endCompoundEdit();
+                compoundEdit = new CompoundEdit();
+                addEdit(compoundEdit);
+            }
+            compoundEdit.addEdit(edit);
+            lastEditTime = now;
+            lastEditType = type;
+            lastOffset = offset;
+            lastLength = length;
+            restartTimer();
+        }
+
+        private void restartTimer() {
+            if (compoundTimer == null) {
+                compoundTimer = new Timer(COMPOUND_DELAY_MS, event -> endCompoundEdit());
+                compoundTimer.setRepeats(false);
+            }
+            compoundTimer.restart();
+        }
+
+        private void endCompoundEdit() {
+            if (compoundEdit != null) {
+                compoundEdit.end();
+                compoundEdit = null;
+            }
+        }
+
+        @Override
+        public synchronized void discardAllEdits() {
+            super.discardAllEdits();
+            endCompoundEdit();
+            if (compoundTimer != null) {
+                compoundTimer.stop();
+            }
+        }
+
+        @Override
+        public synchronized void undo() throws CannotUndoException {
+            endCompoundEdit();
+            super.undo();
+        }
+
+        @Override
+        public synchronized void redo() throws CannotRedoException {
+            endCompoundEdit();
+            super.redo();
+        }
     }
 
     private void removeSelectedAttachments() {
@@ -4033,13 +4269,14 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         if (area == null) {
             return;
         }
-        UndoManager manager = new UndoManager();
+        CompoundUndoManager manager = new CompoundUndoManager();
         area.getDocument().addUndoableEditListener(manager);
         notesUndoManager = manager;
 
         Action undoAction = new AbstractAction() {
             @Override
             public void actionPerformed(ActionEvent event) {
+                manager.endCompoundEdit();
                 if (manager.canUndo()) {
                     manager.undo();
                 }
@@ -4048,6 +4285,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         Action redoAction = new AbstractAction() {
             @Override
             public void actionPerformed(ActionEvent event) {
+                manager.endCompoundEdit();
                 if (manager.canRedo()) {
                     manager.redo();
                 }
@@ -4061,6 +4299,98 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         area.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_Y, mask), "burpnotes-redo");
         area.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, mask | KeyEvent.SHIFT_DOWN_MASK), "burpnotes-redo");
     }
+
+    private void installEditorNavigationBindings(JTextArea area) {
+        if (area == null) {
+            return;
+        }
+        ActionMap actionMap = area.getActionMap();
+        InputMap inputMap = area.getInputMap(JComponent.WHEN_FOCUSED);
+        Action defaultUp = actionMap.get(DefaultEditorKit.upAction);
+        Action defaultDown = actionMap.get(DefaultEditorKit.downAction);
+
+        actionMap.put("burpnotes-caret-up", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                if (isAllSelected(area)) {
+                    area.setCaretPosition(0);
+                    return;
+                }
+                if (defaultUp != null) {
+                    defaultUp.actionPerformed(event);
+                }
+            }
+        });
+        actionMap.put("burpnotes-caret-down", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                if (isAllSelected(area)) {
+                    area.setCaretPosition(area.getDocument().getLength());
+                    return;
+                }
+                if (defaultDown != null) {
+                    defaultDown.actionPerformed(event);
+                }
+            }
+        });
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_UP, 0), "burpnotes-caret-up");
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, 0), "burpnotes-caret-down");
+    }
+
+    private void installEditorSelectionBindings(JTextArea area) {
+        if (area == null) {
+            return;
+        }
+        ActionMap actionMap = area.getActionMap();
+        InputMap inputMap = area.getInputMap(JComponent.WHEN_FOCUSED);
+        actionMap.put("burpnotes-select-up", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                moveSelectionVertically(area, -1);
+            }
+        });
+        actionMap.put("burpnotes-select-down", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                moveSelectionVertically(area, 1);
+            }
+        });
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_UP, KeyEvent.CTRL_DOWN_MASK | KeyEvent.SHIFT_DOWN_MASK),
+            "burpnotes-select-up");
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, KeyEvent.CTRL_DOWN_MASK | KeyEvent.SHIFT_DOWN_MASK),
+            "burpnotes-select-down");
+    }
+
+    private void moveSelectionVertically(JTextArea area, int direction) {
+        if (area == null) {
+            return;
+        }
+        try {
+            int dot = area.getCaretPosition();
+            Rectangle r = area.modelToView(dot);
+            if (r == null) {
+                return;
+            }
+            int target = direction < 0
+                ? Utilities.getPositionAbove(area, dot, r.x)
+                : Utilities.getPositionBelow(area, dot, r.x);
+            if (target < 0) {
+                return;
+            }
+            area.moveCaretPosition(target);
+        } catch (BadLocationException ignored) {
+            // ignore invalid caret positions
+        }
+    }
+
+    private boolean isAllSelected(JTextArea area) {
+        if (area == null) {
+            return false;
+        }
+        int length = area.getDocument().getLength();
+        return length > 0 && area.getSelectionStart() == 0 && area.getSelectionEnd() == length;
+    }
+
 
     private void resetUndoManager() {
         if (notesUndoManager != null) {
@@ -4262,7 +4592,6 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
                         changed = true;
                     }
                 }
-                removeExcludedTags();
                 if (changed || (tagListModel != null && tagListModel.getSize() == 0)) {
                     rebuildTagModel();
                 }
@@ -4694,7 +5023,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         searchDialogField.setFont(bodyFont);
         searchDialogField.getDocument().addDocumentListener(new SimpleDocumentListener(this::scheduleSearchDialog));
 
-        JLabel hint = new JLabel("Search notes (Ctrl+F). Double-click a result to jump.");
+        JLabel hint = new JLabel("Search notes across targets. Double-click a result to jump.");
         hint.setFont(bodyFont);
         hint.setForeground(mutedText);
 
@@ -4748,25 +5077,50 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             return;
         }
         String needle = query.toLowerCase(Locale.ROOT);
-
-        Set<String> targets = collectTargetsForExport(false);
-        for (String target : targets) {
-            TargetState state = getOrCreateState(target);
-            loadStateFromDisk(target, state);
-            addSearchResultsForTarget(target, state.notesText, needle);
-        }
-        unloadInactiveTargetStates();
+        int token = ++searchToken;
+        String currentSnapshot = currentTarget;
+        String currentNotes = notesArea != null ? notesArea.getText() : null;
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            Set<String> targets = collectTargetsForExportSnapshot(false, null, false, false);
+            List<SearchResult> results = new ArrayList<>();
+            for (String target : targets) {
+                String notes;
+                if (currentSnapshot != null && currentSnapshot.equalsIgnoreCase(target) && currentNotes != null) {
+                    notes = currentNotes;
+                } else {
+                    TargetState snapshot = loadTargetStateSnapshot(target);
+                    notes = snapshot.notesText;
+                }
+                addSearchResultsForTarget(target, notes, needle, results);
+            }
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive || searchToken != token || searchResultsModel == null) {
+                    return;
+                }
+                searchResultsModel.clear();
+                for (SearchResult result : results) {
+                    searchResultsModel.addElement(result);
+                }
+            });
+        });
     }
 
-    private void addSearchResultsForTarget(String target, String notes, String needle) {
+    private void addSearchResultsForTarget(String target, String notes, String needle, List<SearchResult> results) {
         if (notes == null || notes.isEmpty()) {
+            return;
+        }
+        if (results == null) {
             return;
         }
         String[] lines = notes.split("\\R", -1);
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i];
             if (line != null && line.toLowerCase(Locale.ROOT).contains(needle)) {
-                searchResultsModel.addElement(new SearchResult(target, i + 1, line));
+                results.add(new SearchResult(target, i + 1, line));
             }
         }
     }
@@ -6444,82 +6798,118 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             return;
         }
+        final boolean useFilter = exportUseFilterCheck != null && exportUseFilterCheck.isSelected();
+        final String exportPathSnapshot = exportPath;
+        final Set<String> filterSnapshot = new TreeSet<>(activeTagFilters);
+        final boolean filterEnabledSnapshot = tagFilterEnabled;
+        final boolean filterMatchAllSnapshot = tagFilterMatchAll;
 
-        boolean useFilter = exportUseFilterCheck != null && exportUseFilterCheck.isSelected();
-        Set<String> targets = collectTargetsForExport(useFilter);
-        if (targets.isEmpty()) {
-            if (callbacks != null) {
-                callbacks.issueAlert("No targets available for export.");
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
             }
-            return;
-        }
-
-        Map<String, List<TargetExport>> byTag = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        for (String target : targets) {
-            TargetState snapshot = new TargetState();
-            loadStateFromDisk(target, snapshot);
-            if (snapshot.selectedTags.isEmpty()) {
-                continue;
+            Set<String> targets = collectTargetsForExportSnapshot(useFilter, filterSnapshot,
+                filterEnabledSnapshot, filterMatchAllSnapshot);
+            if (targets.isEmpty()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("No targets available for export.");
+                    }
+                });
+                return;
             }
-            for (String tag : snapshot.selectedTags) {
-                byTag.computeIfAbsent(tag, key -> new ArrayList<>())
-                    .add(new TargetExport(target, snapshot.notesText));
-            }
-        }
 
-        if (byTag.isEmpty()) {
-            if (callbacks != null) {
-                callbacks.issueAlert("No tagged notes found to export.");
-            }
-            return;
-        }
-
-        StringBuilder out = new StringBuilder();
-        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
-        out.append("# Burp Notes Export\n");
-        out.append("Generated: ").append(timestamp).append("\n\n");
-
-        for (Map.Entry<String, List<TargetExport>> entry : byTag.entrySet()) {
-            List<TargetExport> exports = entry.getValue();
-            out.append("## Tag: ").append(entry.getKey()).append(" (" + exports.size() + " targets)\n\n");
-            for (TargetExport targetExport : exports) {
-                out.append("### Target: ").append(targetExport.target).append("\n\n");
-                String notes = targetExport.notes == null ? "" : targetExport.notes.trim();
-                if (notes.isEmpty()) {
-                    out.append("(no notes)\n\n");
-                } else {
-                    out.append(notes).append("\n\n");
+            Map<String, List<TargetExport>> byTag = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+            for (String target : targets) {
+                TargetState snapshot = loadTargetStateSnapshot(target);
+                if (snapshot.selectedTags.isEmpty()) {
+                    continue;
                 }
-                out.append("---\n\n");
+                for (String tag : snapshot.selectedTags) {
+                    byTag.computeIfAbsent(tag, key -> new ArrayList<>())
+                        .add(new TargetExport(target, snapshot.notesText));
+                }
             }
-        }
 
-        Path output = resolvePath(exportPath);
-        try {
-            Path parent = output.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
+            if (byTag.isEmpty()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("No tagged notes found to export.");
+                    }
+                });
+                return;
             }
-            Files.write(output, out.toString().getBytes(StandardCharsets.UTF_8));
-            if (callbacks != null) {
-                callbacks.issueAlert("Exported notes to: " + output.toString());
+
+            StringBuilder out = new StringBuilder();
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+            out.append("# Burp Notes Export\n");
+            out.append("Generated: ").append(timestamp).append("\n\n");
+
+            for (Map.Entry<String, List<TargetExport>> entry : byTag.entrySet()) {
+                List<TargetExport> exports = entry.getValue();
+                out.append("## Tag: ").append(entry.getKey()).append(" (" + exports.size() + " targets)\n\n");
+                for (TargetExport targetExport : exports) {
+                    out.append("### Target: ").append(targetExport.target).append("\n\n");
+                    String notes = targetExport.notes == null ? "" : targetExport.notes.trim();
+                    if (notes.isEmpty()) {
+                        out.append("(no notes)\n\n");
+                    } else {
+                        out.append(notes).append("\n\n");
+                    }
+                    out.append("---\n\n");
+                }
             }
-        } catch (IOException e) {
-            if (callbacks != null) {
-                callbacks.printError("Export failed: " + e.getMessage());
+
+            Path output = resolvePath(exportPathSnapshot);
+            try {
+                Path parent = output.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+                Files.write(output, out.toString().getBytes(StandardCharsets.UTF_8));
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Exported notes to: " + output.toString());
+                    }
+                });
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.printError("Export failed: " + e.getMessage());
+                    }
+                });
             }
-        }
+        });
     }
 
     private void refreshExportTargetsList() {
         if (exportTargetsListModel == null) {
             return;
         }
+        int token = ++exportTargetsToken;
         exportTargetsListModel.clear();
-        Set<String> targets = collectInScopeTargets();
-        for (String target : targets) {
-            exportTargetsListModel.addElement(target);
-        }
+        exportTargetsListModel.addElement("Loading...");
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            Set<String> targets = collectInScopeTargets();
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive || exportTargetsToken != token || exportTargetsListModel == null) {
+                    return;
+                }
+                exportTargetsListModel.clear();
+                if (targets.isEmpty()) {
+                    exportTargetsListModel.addElement("(none)");
+                    return;
+                }
+                for (String target : targets) {
+                    exportTargetsListModel.addElement(target);
+                }
+            });
+        });
     }
 
     private void exportSelectedTargets() {
@@ -6548,21 +6938,34 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             output = Paths.get(output.toString() + ext);
         }
 
-        String content = json ? buildJsonExport(selected) : buildMarkdownExport(selected);
-        try {
-            Path parent = output.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
+        final boolean jsonSnapshot = json;
+        final List<String> selectedSnapshot = new ArrayList<>(selected);
+        final Path outputSnapshot = output;
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
             }
-            Files.write(output, content.getBytes(StandardCharsets.UTF_8));
-            if (callbacks != null) {
-                callbacks.issueAlert("Exported selected targets to: " + output.toString());
+            String content = jsonSnapshot ? buildJsonExport(selectedSnapshot) : buildMarkdownExport(selectedSnapshot);
+            try {
+                Path parent = outputSnapshot.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+                Files.write(outputSnapshot, content.getBytes(StandardCharsets.UTF_8));
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Exported selected targets to: " + outputSnapshot.toString());
+                    }
+                });
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.printError("Export failed: " + e.getMessage());
+                    }
+                });
             }
-        } catch (IOException e) {
-            if (callbacks != null) {
-                callbacks.printError("Export failed: " + e.getMessage());
-            }
-        }
+        });
     }
 
     private String buildMarkdownExport(List<String> targets) {
@@ -6570,8 +6973,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         out.append("# Burp Notes Export\n\n");
         out.append("Generated: ").append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())).append("\n\n");
         for (String target : targets) {
-            TargetState state = getOrCreateState(target);
-            loadStateFromDisk(target, state);
+            TargetState state = loadTargetStateSnapshot(target);
             out.append("## Target: ").append(target).append("\n\n");
 
             out.append("### Tags\n");
@@ -6646,8 +7048,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             .append("\",\"targets\":[");
         boolean firstTarget = true;
         for (String target : targets) {
-            TargetState state = getOrCreateState(target);
-            loadStateFromDisk(target, state);
+            TargetState state = loadTargetStateSnapshot(target);
             if (!firstTarget) {
                 out.append(",");
             }
@@ -6716,77 +7117,98 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
             }
             return;
         }
-        Path path = resolvePath(pathText);
-        if (!Files.exists(path)) {
+        final String pathSnapshot = pathText;
+        final boolean intoCurrent = importModeCombo == null || importModeCombo.getSelectedIndex() == 0;
+        final boolean replace = importReplaceCheck != null && importReplaceCheck.isSelected();
+        final String currentSnapshot = currentTarget;
+
+        if (intoCurrent && currentSnapshot == null) {
             if (callbacks != null) {
-                callbacks.issueAlert("Import file not found.");
-            }
-            return;
-        }
-        String fileName = path.getFileName() != null ? path.getFileName().toString() : path.toString();
-        String lower = fileName.toLowerCase(Locale.ROOT);
-        boolean isJson = lower.endsWith(".json");
-        boolean isMarkdown = lower.endsWith(".md") || lower.endsWith(".markdown");
-        if (!isJson && !isMarkdown) {
-            if (callbacks != null) {
-                callbacks.issueAlert("Only .md or .json files are supported.");
+                callbacks.issueAlert("Select a target to import into.");
             }
             return;
         }
 
-        String content;
-        try {
-            content = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            if (callbacks != null) {
-                callbacks.issueAlert("Failed to read import file: " + e.getMessage());
-            }
-            return;
-        }
-        if (content.trim().isEmpty()) {
-            if (callbacks != null) {
-                callbacks.issueAlert("Import file is empty.");
-            }
-            return;
-        }
-
-        List<ImportedTarget> imported = isJson ? parseJsonImport(content) : parseMarkdownImport(content);
-        boolean intoCurrent = importModeCombo == null || importModeCombo.getSelectedIndex() == 0;
-        boolean replace = importReplaceCheck != null && importReplaceCheck.isSelected();
-
-        if (intoCurrent) {
-            if (currentTarget == null) {
-                if (callbacks != null) {
-                    callbacks.issueAlert("Select a target to import into.");
-                }
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
                 return;
             }
-            String notes = buildNotesForCurrentImport(imported, content);
-            if (notes.trim().isEmpty()) {
-                if (callbacks != null) {
-                    callbacks.issueAlert("No notes found to import.");
-                }
+            Path path = resolvePath(pathSnapshot);
+            if (!Files.exists(path)) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Import file not found.");
+                    }
+                });
                 return;
             }
-            importNotesIntoCurrent(notes, replace);
-            return;
-        }
+            String fileName = path.getFileName() != null ? path.getFileName().toString() : path.toString();
+            String lower = fileName.toLowerCase(Locale.ROOT);
+            boolean isJson = lower.endsWith(".json");
+            boolean isMarkdown = lower.endsWith(".md") || lower.endsWith(".markdown");
+            if (!isJson && !isMarkdown) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Only .md or .json files are supported.");
+                    }
+                });
+                return;
+            }
 
-        List<ImportedTarget> targets = new ArrayList<>();
-        if (imported != null) {
-            for (ImportedTarget target : imported) {
-                if (target != null && target.target != null && !target.target.trim().isEmpty()) {
-                    targets.add(target);
+            String content;
+            try {
+                content = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Failed to read import file: " + e.getMessage());
+                    }
+                });
+                return;
+            }
+            if (content.trim().isEmpty()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("Import file is empty.");
+                    }
+                });
+                return;
+            }
+
+            List<ImportedTarget> imported = isJson ? parseJsonImport(content) : parseMarkdownImport(content);
+            if (intoCurrent) {
+                String notes = buildNotesForCurrentImport(imported, content);
+                if (notes.trim().isEmpty()) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (callbacks != null) {
+                            callbacks.issueAlert("No notes found to import.");
+                        }
+                    });
+                    return;
+                }
+                SwingUtilities.invokeLater(() -> importNotesIntoCurrent(notes, replace));
+                return;
+            }
+
+            List<ImportedTarget> targets = new ArrayList<>();
+            if (imported != null) {
+                for (ImportedTarget target : imported) {
+                    if (target != null && target.target != null && !target.target.trim().isEmpty()) {
+                        targets.add(target);
+                    }
                 }
             }
-        }
-        if (targets.isEmpty()) {
-            if (callbacks != null) {
-                callbacks.issueAlert("No target sections found. Use 'Import into current target' for plain notes.");
+            if (targets.isEmpty()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (callbacks != null) {
+                        callbacks.issueAlert("No target sections found. Use 'Import into current target' for plain notes.");
+                    }
+                });
+                return;
             }
-            return;
-        }
-        importNotesForTargets(targets, replace);
+            importNotesForTargetsAsync(targets, replace);
+        });
     }
 
     private String buildNotesForCurrentImport(List<ImportedTarget> imported, String fallbackContent) {
@@ -6833,24 +7255,39 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
     }
 
     private void importNotesForTargets(List<ImportedTarget> targets, boolean replace) {
+        importNotesForTargetsAsync(targets, replace);
+    }
+
+    private void importNotesForTargetsAsync(List<ImportedTarget> targets, boolean replace) {
         if (targets == null || targets.isEmpty()) {
             return;
         }
-        for (ImportedTarget target : targets) {
-            if (target == null || target.target == null || target.target.trim().isEmpty()) {
-                continue;
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
             }
-            TargetState state = getOrCreateState(target.target);
-            loadStateFromDisk(target.target, state);
-            String existing = state.notesText == null ? "" : state.notesText;
-            String incoming = target.notes == null ? "" : target.notes;
-            state.notesText = mergeNotesText(existing, incoming, replace);
-            state.dirty = true;
-            enqueueSave(target.target, state);
-        }
-        refreshTargets();
-        updateMemoryUsageLabel();
-        unloadInactiveTargetStates();
+            for (ImportedTarget target : targets) {
+                if (target == null || target.target == null || target.target.trim().isEmpty()) {
+                    continue;
+                }
+                TargetState state = getOrCreateState(target.target);
+                loadStateFromDisk(target.target, state);
+                String existing = state.notesText == null ? "" : state.notesText;
+                String incoming = target.notes == null ? "" : target.notes;
+                state.notesText = mergeNotesText(existing, incoming, replace);
+                state.dirty = true;
+                enqueueSave(target.target, state);
+            }
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive) {
+                    return;
+                }
+                refreshTargets();
+                updateMemoryUsageLabel();
+                unloadInactiveTargetStates();
+            });
+        });
     }
 
     private String mergeNotesText(String existing, String incoming, boolean replace) {
@@ -7056,6 +7493,46 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return targets;
     }
 
+    private Set<String> collectTargetsForExportSnapshot(boolean useFilter,
+                                                        Set<String> filterSnapshot,
+                                                        boolean filterEnabledSnapshot,
+                                                        boolean filterMatchAllSnapshot) {
+        Set<String> targets = new TreeSet<>();
+        targets.addAll(collectInScopeTargets());
+        targets.addAll(targetStates.keySet());
+        targets.addAll(collectStoredTargets());
+        if (useFilter && filterEnabledSnapshot && filterSnapshot != null && !filterSnapshot.isEmpty()) {
+            targets = applyTagFiltersSnapshot(targets, filterSnapshot, filterMatchAllSnapshot);
+        }
+        return targets;
+    }
+
+    private Set<String> applyTagFiltersSnapshot(Set<String> targets, Set<String> filters, boolean matchAll) {
+        if (filters == null || filters.isEmpty()) {
+            return targets;
+        }
+        Set<String> filtered = new TreeSet<>();
+        for (String target : targets) {
+            Set<String> tags = loadTagsFromDisk(target);
+            if (tags.isEmpty()) {
+                continue;
+            }
+            if (matchAll) {
+                if (tags.containsAll(filters)) {
+                    filtered.add(target);
+                }
+            } else {
+                for (String tag : filters) {
+                    if (tags.contains(tag)) {
+                        filtered.add(target);
+                        break;
+                    }
+                }
+            }
+        }
+        return filtered;
+    }
+
     private Set<String> collectStoredTargets() {
         Set<String> targets = new TreeSet<>();
         String base = storageDirectory;
@@ -7074,13 +7551,60 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         return targets;
     }
 
+    private void refreshAnalyticsAsync() {
+        if (tagAnalyticsArea == null) {
+            return;
+        }
+        int token = ++analyticsToken;
+        tagAnalyticsArea.setText("Loading analytics...");
+        String currentSnapshot = currentTarget;
+        Set<String> tagsSnapshot = null;
+        if (currentSnapshot != null) {
+            TargetState state = targetStates.get(currentSnapshot);
+            if (state != null && state.loaded) {
+                tagsSnapshot = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+                tagsSnapshot.addAll(state.selectedTags);
+                tagsSnapshot.removeAll(state.notApplicableTags);
+            }
+        }
+        final String currentTargetSnapshot = currentSnapshot;
+        final Set<String> currentTagsSnapshot = tagsSnapshot;
+        ensureBackgroundExecutor();
+        backgroundExecutor.submit(() -> {
+            if (!extensionActive) {
+                return;
+            }
+            Set<String> targets = collectTargetsForExportSnapshot(false, null, false, false);
+            String report = buildTagAnalyticsReportSnapshot(targets, currentTargetSnapshot, currentTagsSnapshot);
+            SwingUtilities.invokeLater(() -> {
+                if (!extensionActive || analyticsToken != token || tagAnalyticsArea == null) {
+                    return;
+                }
+                tagAnalyticsArea.setText(report);
+            });
+        });
+    }
+
     private String buildTagAnalyticsReport() {
-        Set<String> targets = collectTargetsForExport(false);
+        Set<String> targets = collectTargetsForExportSnapshot(false, null, false, false);
+        return buildTagAnalyticsReportSnapshot(targets, null, null);
+    }
+
+    private String buildTagAnalyticsReportSnapshot(Set<String> targets,
+                                                   String currentSnapshot,
+                                                   Set<String> currentTags) {
+        Set<String> targetSet = targets == null ? new TreeSet<>() : targets;
         Map<String, Integer> tagCounts = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         Map<String, Integer> targetTagCounts = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
-        for (String target : targets) {
-            Set<String> tags = getTargetTagsQuick(target);
+        for (String target : targetSet) {
+            Set<String> tags;
+            if (currentSnapshot != null && currentSnapshot.equalsIgnoreCase(target) && currentTags != null) {
+                tags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+                tags.addAll(currentTags);
+            } else {
+                tags = loadTagsFromDisk(target);
+            }
             if (tags.isEmpty()) {
                 continue;
             }
@@ -7091,7 +7615,7 @@ public class BurpExtender implements IBurpExtender, ITab, IScopeChangeListener, 
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("Targets analyzed: ").append(targets.size()).append("\n");
+        sb.append("Targets analyzed: ").append(targetSet.size()).append("\n");
         sb.append("Tagged targets: ").append(targetTagCounts.size()).append("\n\n");
 
         sb.append("Top Tags:\n");
